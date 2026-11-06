@@ -1,0 +1,10 @@
+# Streamlit Cloud (แอป Dashboard)
+streamlit>=1.40,<2
+pandas>=2.2,<4
+numpy>=1.26,<3
+requests>=2.31,<3
+pydantic>=2.6,<3
+plotly>=5.22,<7
+google-genai>=1.20,<2
+tabulate>=0.9
+feedparser>=6.0,<7
