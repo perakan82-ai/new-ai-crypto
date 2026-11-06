@@ -1,0 +1,790 @@
+"""Module 3 + Orchestration — Scanner, Portfolio Agent, รายงาน และ pipeline รวมทุก Agent"""
+from __future__ import annotations
+
+import json
+import logging
+import numpy as np
+import pandas as pd
+import sources as na
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Callable
+from typing import Literal
+from ai import _r, fallback_strategy, gemini_json, llm_fn, research_agent, strategist_and_risk
+from config import FEE, QUOTE, REG_TH, STABLES, STATUS_TXT, TZ_TH, dist, fbig, fp, fpct, fprob
+from analysis import BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent, touch_prob
+from sources import cg_global, external_bundle, fear_greed, fundamentals_for, rss_for
+from market import MarketData, add_indicators, closed_only, fetch_frames
+from signals import build_signal
+
+
+# ════════════════════ portfolio ════════════════════
+PF_ACT = {"CUT": "✂️ คัดลอส", "REDUCE": "🟠 ลดน้ำหนัก", "TRIM": "🟡 ทยอยขายทำกำไร", "HOLD": "🔵 ถือต่อ",
+          "HOLD_LONG": "🏦 ถือยาว", "ADD": "🟢 ถัวเพิ่ม"}
+PF_SEV = {"CUT": 0, "REDUCE": 1, "TRIM": 2, "HOLD": 3, "HOLD_LONG": 4, "ADD": 5}
+PF_SLOTS = 10
+
+
+class HoldingView(BaseModel):
+    ticker: str
+    action: Literal["CUT", "REDUCE", "TRIM", "HOLD", "HOLD_LONG", "ADD"]
+    verdict: str
+    reasons: list[str]
+    plan: str
+
+
+class PortfolioReview(BaseModel):
+    overall: str
+    holdings: list[HoldingView]
+    rebalance: list[str]
+
+
+def _sev_to_act(sev: int) -> str:
+    return next(k for k, x in PF_SEV.items() if x == sev)
+
+
+def holding_plan(c: dict, qty: float, cost: float, news_c: dict | None) -> dict:
+    price, atr_ = c["price"], float(c["d1"]["atr"].iloc[-1])
+    m, l, cf = c["med"], c["long"], c["cf"]
+    rsi = float(c["d1"]["rsi"].iloc[-1])
+    pnl = price / cost - 1
+    stop_d = m["support"] - 1.2 * atr_
+    trailed = False
+    if pnl > 0.15:
+        new = max(stop_d, cost * 1.02, price - 2.5 * atr_)
+        trailed, stop_d = new > stop_d, new
+    stop_w = min(l["stop"], stop_d * 0.97)
+    cands = {m["tp1"], m["tp2"], l["tp1"], l["tp2"]} | {L["level"] for L in c["levels"] if L["strength"] >= 2}
+    ladder: list[float] = []
+    for x in sorted(cands):
+        if x > price * 1.03 and (not ladder or x >= ladder[-1] * 1.06):
+            ladder.append(x)
+        if len(ladder) == 3:
+            break
+    while len(ladder) < 3:
+        ladder.append((ladder[-1] if ladder else price) * 1.25)
+    probs = [{H: touch_prob(c, x, H) for H in (30, 90, 180)} for x in ladder]
+    p_be = {H: (touch_prob(c, cost, H) if cost > price else 1.0) for H in (30, 90, 180)}
+    p_stop = {H: touch_prob(c, stop_d, H) for H in (30, 90)}
+    ft = first_touch(c, ladder[0], stop_d, 90, price) or {}
+    ev = (ft.get("p_tp") or 0) * (ladder[0] / price - 1) - (ft.get("p_sl") or 0) * (1 - stop_d / price)
+
+    p180 = p_be[180] or 0
+    hard = price <= stop_d
+    if hard:
+        act, why = "CUT", f"ราคาหลุดจุดป้องกัน {fp(stop_d)} แล้ว"
+    elif pnl < 0:
+        if cf["regime"] == "DOWN" and l["w_down"] and p180 < 0.35:
+            act, why = "CUT", f"ขาลงทั้งรายวันและรายสัปดาห์ + โอกาสกลับไปทุนใน 6 เดือนแค่ {fprob(p180)}"
+        elif cf["regime"] == "DOWN" or l["w_down"]:
+            act, why = "REDUCE", "แนวโน้มยังเป็นขาลง → ลดครึ่งหนึ่ง ที่เหลือรอขายตามบันได"
+        elif (m["status"] == "🟢" or l["status"] == "🟢") and pnl > -0.25:
+            act, why = "ADD", "ราคาอยู่โซนแนวรับ + โครงสร้างยังดี → ถัวลดต้นทุนได้"
+        elif l["status"] != "🔴" and p180 >= 0.45:
+            act, why = "HOLD_LONG", f"โครงสร้างระยะยาวยังไม่เสีย โอกาสกลับไปทุนใน 6 เดือน {fprob(p180)}"
+        else:
+            act, why = "HOLD", "ยังไม่หลุดจุดป้องกัน รอสัญญาณชัดขึ้น"
+    else:
+        if pnl > 0.25 and (rsi > 70 or price >= 0.97 * ladder[0]):
+            act, why = "TRIM", f"กำไร {fpct(pnl, 0)} + {'RSI สูง' if rsi > 70 else 'ใกล้แนวต้านหลัก'} → ทยอยขาย"
+        elif cf["regime"] == "DOWN" or l["w_down"]:
+            act, why = "REDUCE", "มีกำไรแต่แนวโน้มเริ่มเสีย → ล็อกกำไรบางส่วน"
+        elif l["w_up"]:
+            act, why = "HOLD_LONG", "แนวโน้มรายสัปดาห์ขาขึ้น → ถือยาว ขายตามบันได"
+        else:
+            act, why = "HOLD", "โครงสร้างยังไม่เสีย"
+    news_note = ""
+    if news_c and news_c["score"] <= -0.45 and news_c["confidence"] >= 0.45 and act != "CUT":
+        act = _sev_to_act(max(PF_SEV[act] - 1, PF_SEV["REDUCE"]))
+        news_note = f"ข่าวลบแรง ({news_c['score']:+.2f}) → ลดระดับคำแนะนำ"
+    portions = {"TRIM": (40, 30, 30), "HOLD_LONG": (25, 35, 40), "REDUCE": (50, 25, 25)}.get(act, (33, 33, 34))
+    return {"ticker": c["ticker"], "qty": qty, "cost": cost, "price": price, "pnl": pnl, "pnl_usd": qty * (price - cost),
+            "value": qty * price, "act_sys": act, "why": why, "hard": hard, "news_note": news_note,
+            "stop_d": stop_d, "stop_w": stop_w, "trailed": trailed, "ladder": ladder, "probs": probs,
+            "portions": portions, "p_be": p_be, "p_stop": p_stop, "ft": ft, "ev": ev, "rsi": rsi,
+            "regime": cf["regime"], "med_status": m["status"], "long_status": l["status"], "news": news_c}
+
+
+def _pf_brief(h: dict, c: dict) -> dict:
+    return {"ticker": h["ticker"], "qty": h["qty"], "avg_cost": _r(h["cost"], 6), "price": _r(h["price"], 6),
+            "pnl_pct": _r(h["pnl"] * 100, 1), "system_action": h["act_sys"], "system_reason": h["why"],
+            "regime": REG_TH[h["regime"]], "structure_1d": c["struct_d"]["label"], "structure_1w": c["struct_w"]["label"],
+            "rsi": _r(h["rsi"], 0), "medium_status": h["med_status"], "long_status": h["long_status"],
+            "stop_daily": _r(h["stop_d"], 6), "stop_weekly": _r(h["stop_w"], 6),
+            "sell_ladder": [{"price": _r(x, 6), "portion_pct": pc, "p_touch_30d": _r(p[30]), "p_touch_90d": _r(p[90]),
+                             "p_touch_180d": _r(p[180])} for x, pc, p in zip(h["ladder"], h["portions"], h["probs"])],
+            "p_back_to_cost": {f"{k}d": _r(v) for k, v in h["p_be"].items()},
+            "p_ladder1_before_stop_90d": _r(h["ft"].get("p_tp")), "expected_value_pct": _r(h["ev"] * 100, 1),
+            "fund": {"rank": c["fund"].get("rank"), "ath_dist": _r(c["fund"].get("ath_dist"))},
+            "news": {k: (h["news"] or {}).get(k) for k in ("score", "label", "summary", "drivers")}}
+
+
+def portfolio_ai(client, model: str, holds: list[dict], coins: dict, macro: dict, corr: pd.DataFrame):
+    prompt = f"""คุณคือ Portfolio Advisor Agent (Spot) ระดับมืออาชีพ ประเมินพอร์ตจริงของผู้ใช้
+MACRO: {json.dumps({k: macro[k] for k in ('regime', 'notes')}, ensure_ascii=False)}
+HOLDINGS (ตัวเลขทั้งหมดระบบคำนวณแล้ว): {json.dumps([_pf_brief(h, coins[h['ticker']]) for h in holds], ensure_ascii=False, default=str)}
+Correlation 90D ระหว่างเหรียญในพอร์ต: {corr.to_json() if len(corr) else "{}"}
+
+สำหรับทุกเหรียญ ให้:
+- action: CUT / REDUCE / TRIM / HOLD / HOLD_LONG / ADD (ระบบยอมให้ต่างจาก system_action ได้ไม่เกิน 1 ระดับ)
+- verdict: ข้อสรุป 1 ประโยคที่ชัดเจน
+- reasons: 3 เหตุผล (เทคนิค/สถิติ/ข่าว-พื้นฐาน) อ้างตัวเลขจากข้อมูล
+- plan: แผนปฏิบัติ 1-2 ประโยค (ขายกี่ % ที่ราคาไหน, ถ้าขาดทุน: โอกาสคืนทุน vs ค่าเสียโอกาส)
+และ overall = ภาพรวมพอร์ต 2 ประโยค, rebalance = คำแนะนำปรับพอร์ต 2-4 ข้อ
+กฎ: ใช้เฉพาะราคาที่อยู่ในข้อมูล ห้ามคิดราคาใหม่ · ภาษาไทยกระชับ"""
+    out, _, _, errs = gemini_json(client, model, prompt, PortfolioReview, search=False)
+    if not out:
+        return None, errs
+    for v in out.holdings:
+        v.ticker = v.ticker.upper().replace(QUOTE, "").strip()
+    return out, errs
+
+
+def enforce_holding_ai(h: dict, v: HoldingView | None) -> str:
+    """AI เปลี่ยนคำแนะนำได้ไม่เกิน 1 ระดับ และเปลี่ยนไม่ได้เมื่อหลุดจุดคัดลอสแล้ว"""
+    if v is None or h["hard"]:
+        return h["act_sys"]
+    s, a = PF_SEV[h["act_sys"]], PF_SEV[v.action]
+    if h["news_note"] and a > s:
+        return h["act_sys"]
+    if abs(a - s) <= 1:
+        return v.action
+    return _sev_to_act(s + (1 if a > s else -1))
+
+
+def holding_md(h: dict) -> str:
+    v = h.get("view") or {}
+    pr, cost, p = h["probs"], h["cost"], h["price"]
+    ai_txt = f" · AI: {PF_ACT[h['act_ai']]}" if h.get("act_ai") and h["act_ai"] != h["act"] else ""
+    rows = [f"| 🛑 คัดลอส (ปิดรายวัน) | {fp(h['stop_d'])}{' ⬆️trail' if h['trailed'] else ''} | {fpct(h['stop_d'] / cost - 1)} | "
+            f"{fpct(h['stop_d'] / p - 1)} | {fprob(h['p_stop'][30])} / {fprob(h['p_stop'][90])} / – | ขายทั้งหมด |",
+            f"| 🧱 ยอมแพ้ระยะยาว (ปิดรายสัปดาห์) | {fp(h['stop_w'])} | {fpct(h['stop_w'] / cost - 1)} | {fpct(h['stop_w'] / p - 1)} | – | ขายทั้งหมด |"]
+    if cost > p:
+        rows.append(f"| ↩️ คืนทุน | {fp(cost)} | 0% | {fpct(cost / p - 1)} | {fprob(h['p_be'][30])} / {fprob(h['p_be'][90])} / "
+                    f"{fprob(h['p_be'][180])} | – |")
+    for i, (x, pc, pb) in enumerate(zip(h["ladder"], h["portions"], pr)):
+        rows.append(f"| 🎯 ขายไม้ {i + 1} | {fp(x)} | {fpct(x / cost - 1)} | {fpct(x / p - 1)} | "
+                    f"{fprob(pb[30])} / {fprob(pb[90])} / {fprob(pb[180])} | ขาย {pc}% |")
+    reasons = "\n".join(f"{i + 1}. {x}" for i, x in enumerate(v.get("reasons", []))) or f"- {h['why']}"
+    nw = h.get("news")
+    news_line = f"\n**📰 ข่าว:** {nw['emoji']} {nw['label']} ({nw['score']:+.2f}) — {nw['summary']}" if nw else ""
+    plan = f"\n**แผน:** {v['plan']}" if v.get("plan") else ""
+    note = f"\n⚠️ {h['news_note']}" if h["news_note"] else ""
+    sign = "+" if h["pnl_usd"] >= 0 else "-"
+    return f"""### {PF_ACT[h['act']].split()[0]} {h['ticker']} · ถือ {h['qty']:g} @ {fp(cost)} → {fp(p)} ({fpct(h['pnl'])} · {sign}${abs(h['pnl_usd']):,.0f})
+**คำแนะนำ: {PF_ACT[h['act']]}** (ระบบ: {PF_ACT[h['act_sys']]}{ai_txt}) · Regime {REG_TH[h['regime']]} · ระยะกลาง {h['med_status']} · ระยะยาว {h['long_status']}
+
+> 🧠 {v.get('verdict') or h['why']}
+
+**ทำไม:**
+{reasons}
+{plan}{note}{news_line}
+
+| ระดับ | ราคา | จากทุน | จากราคาตอนนี้ | โอกาสแตะ 30 / 90 / 180 วัน | ทำอะไร |
+|---|---|---|---|---|---|
+{chr(10).join(rows)}
+
+โอกาสถึงไม้ 1 ก่อนโดนคัดลอส (90 วัน): **{fprob(h['ft'].get('p_tp'))}** · โดนคัดลอสก่อน: {fprob(h['ft'].get('p_sl'))} · ค่าคาดหวัง {h['ev'] * 100:+.1f}%
+
+---
+"""
+
+
+# ════════════════════ report ════════════════════
+# ───────────────────────── Position sizing ─────────────────────────
+def size_medium(c: dict, capital: float, risk_pct: float, alloc_pct: float | None) -> dict:
+    """ขนาดไม้จากความเสี่ยงต่อไม้ (% ทุน) แต่ไม่เกิน allocation/cap"""
+    m = c["med"]
+    per_unit = m["entry"] - m["sl"]
+    qty = capital * risk_pct / 100 / per_unit
+    cap = min(capital * (alloc_pct if alloc_pct else cap_for(c)) / 100, capital)
+    if qty * m["entry"] > cap:
+        qty = cap / m["entry"]
+    loss = qty * per_unit + qty * m["entry"] * 2 * FEE
+    return {"qty": qty, "notional": qty * m["entry"], "loss": loss, "loss_pct": loss / capital * 100}
+
+
+def size_long(c: dict, capital: float, alloc_pct: float | None) -> dict:
+    l = c["long"]
+    budget = capital * (alloc_pct if alloc_pct else min(10.0, cap_for(c))) / 100
+    tiers = [{"price": p, "usd": budget * w, "qty": budget * w / p, "w": w} for p, w in zip(l["tiers"], l["weights"])]
+    qty = sum(t["qty"] for t in tiers)
+    return {"budget": budget, "tiers": tiers, "qty": qty, "avg": budget / qty, "loss_at_stop": budget - qty * l["stop"]}
+
+
+# ───────────────────────── Text helpers ─────────────────────────
+def key_catalyst(c: dict, research: dict) -> str:
+    rd = ((research.get(c["ticker"]) or {}).get("data")) or {}
+    ev = rd.get("events") or []
+    if ev:
+        warn = "" if ev[0].get("source_url", "").startswith("http") else "⚠️ "
+        return f"{warn}{ev[0]['title'][:40]} ({ev[0]['date']})"
+    if rd.get("strengths"):
+        return rd["strengths"][0][:50]
+    return c["struct_d"]["label"]
+
+
+def news_badge(c: dict) -> str:
+    n = c.get("news")
+    return f"{n['emoji']} {n['score']:+.2f} ({n['n']})" if n else "-"
+
+
+def rule_verdict(c: dict) -> str:
+    m, l = c["med"], c["long"]
+    f30 = c["fc"].get(30, {})
+    if m["status"] == "🟢":
+        s = f"ซื้อได้ในโซน {fp(m['zone'][0])}–{fp(m['zone'][1])} เป้า {fp(m['tp1'])}"
+    elif m["status"] == "🟡":
+        s = f"ตั้งรอซื้อ {fp(m['zone'][0])}–{fp(m['zone'][1])} (โอกาสได้ของใน 14 วัน {fprob(m['p_fill'])}) เป้า {fp(m['tp1'])}"
+    else:
+        s = f"เลี่ยงระยะกลาง · ระยะยาว {STATUS_TXT[l['status']]} DCA เริ่ม {fp(l['tiers'][0])}"
+    if m["ft1"] and m["status"] != "🔴":
+        s += f" · โอกาสถึงก่อน SL {fprob(m['ft1']['p_tp'])}"
+    if f30:
+        s += f" · 30 วัน: โอกาส 50% แตะ {fp(f30['reach50'])}"
+    return s
+
+
+# ───────────────────────── Tables ─────────────────────────
+def table_medium(coins, research, final_win) -> pd.DataFrame:
+    rows = []
+    for c in coins:
+        m = c["med"]
+        ft = m["ft1"] or {}
+        rows.append({
+            "Ticker": ("⭐" if c.get("is_pick") else "") + c["ticker"], "ราคา": fp(c["price"]),
+            "คำแนะนำ": f"{m['status']} {STATUS_TXT[m['status']]}",
+            "Entry Zone": f"{fp(m['zone'][0])} – {fp(m['zone'][1])}", "Stop Loss": fp(m["sl"]),
+            "TP1 / TP2": f"{fp(m['tp1'])} / {fp(m['tp2'])}", "R:R": f"1:{m['rr1']:.1f} / 1:{m['rr2']:.1f}",
+            "Win Rate": f"{final_win.get((c['ticker'], 'MEDIUM'), m['win_sys']):.0f}% (คุ้มทุน {m['be_win']:.0f}%)",
+            "TP1 ก่อน SL": (f"{fprob(ft.get('p_tp'))} · ~{ft['days_tp']:.0f} วัน" if ft.get("days_tp")
+                           else fprob(ft.get("p_tp"))),
+            "Time stop": f"{m['tstop']} วัน", "ข่าว 7D": news_badge(c), "Key Catalyst": key_catalyst(c, research),
+        })
+    return pd.DataFrame(rows)
+
+
+def table_long(coins, research, final_win) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "Ticker": ("⭐" if c.get("is_pick") else "") + c["ticker"], "ราคา": fp(c["price"]),
+        "คำแนะนำ": f"{c['long']['status']} {STATUS_TXT[c['long']['status']]}", "กรอบเวลา": c["long"]["hold"],
+        "Win Rate": f"{final_win.get((c['ticker'], 'LONG'), c['long']['win_sys']):.0f}%",
+        "DCA T1/T2/T3": " / ".join(fp(t) for t in c["long"]["tiers"]),
+        "น้ำหนัก": "/".join(f"{int(w * 100)}" for w in c["long"]["weights"]),
+        "ต้นทุนเฉลี่ย": fp(c["long"]["avg"]), "TP1 / TP2": f"{fp(c['long']['tp1'])} / {fp(c['long']['tp2'])}",
+        "โอกาสแตะ TP1 ใน 180D": fprob(c["long"]["p_tp1_180"]), "ข่าว 7D": news_badge(c),
+        "ตัดขาดทุน (W close)": fp(c["long"]["stop"]), "Key Catalyst": key_catalyst(c, research),
+    } for c in coins])
+
+
+def table_forecast(coins) -> pd.DataFrame:
+    rows = []
+    for c in coins:
+        for H in (14, 30, 90, 180):
+            v = c["fc"].get(H)
+            if not v:
+                continue
+            rows.append({"Ticker": c["ticker"], "ภายใน": f"{H} วัน", "ราคาตอนนี้": fp(c["price"]),
+                         "70% แตะ ≥": f"{fp(v['reach70'])} ({dist(c, v['reach70'])})",
+                         "50% แตะ ≥": f"{fp(v['reach50'])} ({dist(c, v['reach50'])})",
+                         "30% แตะ ≥": f"{fp(v['reach30'])} ({dist(c, v['reach30'])})",
+                         "ย่อลึก (50%)": f"{fp(v['dip50'])} ({dist(c, v['dip50'])})",
+                         "กรอบปลายงวด": f"{fp(v['end25'])} – {fp(v['end75'])}",
+                         "โอกาสปิดสูงกว่าวันนี้": fprob(v["p_up"]), "ตัวอย่างอิสระ": v["n_eff"]})
+    return pd.DataFrame(rows)
+
+
+def table_backtest(coins) -> pd.DataFrame:
+    """ผล Backtest ของแผนระยะกลาง (เข้าแท่งถัดไป · หักค่าธรรมเนียม+slippage)"""
+    rows = []
+    for c in coins:
+        b = c["bt"]
+        rows.append({"Ticker": c["ticker"], "ไม้": b["n"], "Win (ดิบ)": fprob(b["win_rate_raw"]) if b["n"] else "-",
+                     "Expectancy": f"{b['expectancy']:+.2f}R",
+                     "Profit Factor": f"{b['profit_factor']:.2f}" if b["profit_factor"] else "-",
+                     "Max DD": f"{b['max_dd_R']:.1f}R",
+                     "In-sample": f"{b['is_n']} ไม้ · {b['is_expectancy']:+.2f}R",
+                     "Out-of-sample": f"{b['oos_n']} ไม้ · {b['oos_expectancy']:+.2f}R" if b["oos_n"] else "-",
+                     "SL/TP (ATR)": f"{b['sl_mult']:.1f} / {b['tp_mult']:.1f}"})
+    return pd.DataFrame(rows)
+
+
+def forecast_md(c: dict) -> str:
+    lines = ["| ภายใน | โอกาส 70% แตะ ≥ | โอกาส 50% แตะ ≥ | โอกาส 30% แตะ ≥ | ย่อลึก (50%) | กรอบปลายงวด (50% กลาง) | ปิดสูงกว่าวันนี้ |",
+             "|---|---|---|---|---|---|---|"]
+    for H, v in c["fc"].items():
+        lines.append(f"| {H} วัน | {fp(v['reach70'])} ({dist(c, v['reach70'])}) | {fp(v['reach50'])} ({dist(c, v['reach50'])}) | "
+                     f"{fp(v['reach30'])} ({dist(c, v['reach30'])}) | {fp(v['dip50'])} ({dist(c, v['dip50'])}) | "
+                     f"{fp(v['end25'])}–{fp(v['end75'])} | {fprob(v['p_up'])} |")
+    return "\n".join(lines)
+
+
+def deep_dive_md(c: dict, research: dict, views: dict, pick_by: dict, capital: float, risk_pct: float,
+                 news_ctx: dict | None = None) -> str:
+    m, l, r, f, cf = c["med"], c["long"], c["risk"], c["fund"], c["cf"]
+    d = c["d1"].iloc[-1]
+    rr = research.get(c["ticker"]) or {}
+    rd, verified = rr.get("data") or {}, rr.get("verified", True)
+    v = views.get(c["ticker"]) or {}
+    pm, pl = pick_by.get((c["ticker"], "MEDIUM")), pick_by.get((c["ticker"], "LONG"))
+    win_m = pm["win_final"] if pm else m["win_sys"]
+    win_l = pl["win_final"] if pl else l["win_sys"]
+    sm = size_medium(c, capital, risk_pct, pm["alloc_final"] if pm else None)
+    sl_ = size_long(c, capital, pl["alloc_final"] if pl else None)
+    ft1, ft2 = m["ft1"] or {}, m["ft2"] or {}
+    bt = c["bt"]
+    reasons = "\n".join(f"{i + 1}. {x}" for i, x in enumerate(v.get("reasons", []))) or \
+        "\n".join(f"- {x}" for x in m["reasons"])
+    ev = "\n".join(f"- `{e['date']}` **{e['type']}** {e['title']} · {e['impact']} · {e['certainty']}"
+                   + (f" ([ที่มา]({e['source_url']}))" if e.get("source_url", "").startswith("http") else " ⚠️ ไม่มีลิงก์อ้างอิง")
+                   for e in rd.get("events", [])) or "- ไม่พบข้อมูลยืนยัน"
+    news = "\n".join(f"- {n}" for n in rd.get("news_30d", [])[:5]) or "- (เปิด AI Research เพื่อดูข่าว)"
+    if rd and not verified:
+        news = "⚠️ *ข้อมูลจาก AI ที่ไม่ได้ค้นเว็บ อาจไม่อัปเดต*\n" + news
+    tiers = "\n".join(f"| T{i + 1} | {fp(t['price'])} | {dist(c, t['price'])} | {int(t['w'] * 100)}% | ${t['usd']:,.0f} | {t['qty']:.4g} | {fprob(l['tier_fill'][i])} |"
+                      for i, t in enumerate(sl_["tiers"]))
+    pf = f"{f['pf']:.1f}x" if f.get("pf") else "-"
+    tp1_txt = f"{fprob(ft1.get('p_tp'))} ภายใน {m['tstop']} วัน" + (f" (~{ft1['days_tp']:.0f} วัน)" if ft1.get("days_tp") else "")
+    news_sec = (na.news_md(news_ctx["report"], news_ctx["items"], c["ticker"], 5)
+                if (news_ctx and news_ctx.get("items")) else "- ปิด News Agent")
+    watch = f"**👀 จับตา:** {v['watch']}" if v.get("watch") else ""
+    pat_md = "\n".join(f"- **{p['name']}** {BIAS_TH[p['bias']]} · {p['state']} · ระดับ {fp(p['level'])} → เป้า {fp(p['target'])} "
+                       f"({dist(c, p['target'])}, โอกาสแตะใน 60 วัน {fprob(p.get('p_target_60'))}) · {p['note']}"
+                       for p in c.get("patterns", [])) or f"- ไม่พบรูปแบบเด่น · แท่งล่าสุด: {c['pattern']}"
+    strat = f"> 🧭 Strategist: {pm['rationale']} · ⚠️ {pm['key_risk']}" if pm else ""
+    invalid = v.get("invalidation") or f"ราคาปิดต่ำกว่า {fp(m['sl'])} (ระยะกลาง) / Weekly ปิดต่ำกว่า {fp(l['stop'])} (ระยะยาว)"
+    oos = f" · Out-of-sample {bt['oos_n']} ไม้ {bt['oos_expectancy']:+.2f}R" if bt["oos_n"] else ""
+    obv = "↑ สะสม" if c["d1"]["obv"].iloc[-1] > c["d1"]["obv"].iloc[-21] else "↓ แจกจ่าย"
+    fdvm = f"{f['fdv_mcap']:.2f}" if f.get("fdv_mcap") else "-"
+    proj = f"- **โปรเจกต์:** {rd.get('project', '')} · Tokenomics: {rd.get('tokenomics', '-')}" if rd else ""
+    bb = f"- 🐂 {rd.get('bull_case', '-')} · 🐻 {rd.get('bear_case', '-')} · Catalyst {rd.get('catalyst_score')}" if rd else ""
+    return f"""### 🪙 {f.get('name') or c['ticker']} ({c['ticker']}) · {fp(c['price'])}
+**⏱ ระยะกลาง:** {m['status']} {STATUS_TXT[m['status']]} · **🏦 ระยะยาว:** {l['status']} {STATUS_TXT[l['status']]} · **Regime:** {REG_TH[cf['regime']]} · **Score:** {c['score']:.0f}/100
+
+> 🧠 **สรุป:** {v.get('verdict') or rule_verdict(c)}
+
+**ทำไม:**
+{reasons}
+
+**❌ มุมมองผิดเมื่อ:** {invalid}
+{watch}
+
+#### 🎯 แผนระยะกลาง (Swing {m['hold']})
+| จุด | ราคา | ห่างจากตอนนี้ | โอกาส / เวลา | ทำอะไร |
+|---|---|---|---|---|
+| 🟦 ซื้อ | {fp(m['zone'][0])} – {fp(m['zone'][1])} | {dist(c, m['zone'][1])} | ได้ของใน 14 วัน {fprob(m['p_fill'])} | ตั้ง Limit แบ่ง 2 ไม้ |
+| 🛑 Stop Loss | {fp(m['sl'])} | {dist(c, m['sl'])} | โดนก่อน TP1 {fprob(ft1.get('p_sl'))} | ขายทั้งหมดทันที |
+| ✅ TP1 | {fp(m['tp1'])} | {dist(c, m['tp1'])} | {tp1_txt} | ขาย 50% + เลื่อน SL ไปที่ทุน |
+| 🚀 TP2 | {fp(m['tp2'])} | {dist(c, m['tp2'])} | {fprob(ft2.get('p_tp'))} ภายใน {min(90, m['tstop'] * 2)} วัน | ขายส่วนที่เหลือ |
+| ⏳ Time stop | {m['tstop']} วัน | | | ไม่ถึง TP1 → ขายออก |
+
+R:R **1:{m['rr1']:.1f} / 1:{m['rr2']:.1f}** · Win rate **{win_m:.0f}%** (คุ้มทุนที่ {m['be_win']:.0f}%) · Backtest {bt['n']} ไม้ expectancy {bt['expectancy']:+.2f}R{oos} (เข้าแท่งถัดไป หักค่าธรรมเนียม+slippage)
+→ ขนาดไม้: **{sm['qty']:.4g} {c['ticker']} ≈ ${sm['notional']:,.0f}** · ขาดทุนถึง SL ${sm['loss']:,.0f} ({sm['loss_pct']:.2f}% ของทุน)
+{strat}
+
+#### 🏦 แผนระยะยาว (DCA · ถือ {l['hold']})
+| Tier | ราคา | ห่างจากตอนนี้ | น้ำหนัก | เงิน | จำนวน | ได้ของใน 90 วัน |
+|---|---|---|---|---|---|---|
+{tiers}
+
+ต้นทุนเฉลี่ย **{fp(sl_['avg'])}** · TP1 **{fp(l['tp1'])}** ({dist(c, l['tp1'])}, แตะใน 180 วัน {fprob(l['p_tp1_180'])}) ขาย 30% · TP2 **{fp(l['tp2'])}** ({dist(c, l['tp2'])}, {fprob(l['p_tp2_180'])}) ขายที่เหลือ
+· 🛑 ตัดขาดทุนเมื่อ **Weekly ปิด < {fp(l['stop'])}** (ขาดทุนสูงสุด ~${sl_['loss_at_stop']:,.0f}) · Win rate {win_l:.0f}%
+
+#### 📰 ข่าว & Sentiment 7 วัน
+{news_sec}
+
+#### 📐 รูปแบบกราฟ (1D)
+{pat_md}
+
+#### 📈 คาดการณ์ราคา (สถิติของเหรียญนี้ ปรับตามความผันผวนปัจจุบัน)
+{forecast_md(c)}
+
+<details><summary>🔬 รายละเอียดเทคนิค / พื้นฐาน / ข่าว</summary>
+
+- **โครงสร้าง:** 1D {c['struct_d']['label']} {c['struct_d']['bos']} · 1W {c['struct_w']['label']} · EMA9/21/50/200 = {fp(d.ema9)} / {fp(d.ema21)} / {fp(d.ema50)} / {fp(d.ema200)} · RSI {d.rsi:.0f} · ADX {d.adx:.0f} · แท่งล่าสุด: {c['pattern']} · 4H trigger {'✅' if m['trig4h'] else '—'}
+- **Bollinger/VWAP:** BB {fp(d.bb_lo)}–{fp(d.bb_up)} (กว้าง {d.bb_width * 100:.1f}%) · VWAP20 {fp(d.vwap20)}
+- **Volume Profile 180D:** POC {fp(c['vp']['poc'])} · Value Area {fp(c['vp']['val'])}–{fp(c['vp']['vah'])} · Vol ratio {d.vol_ratio:.2f}x · OBV 20D {obv}
+- **Fib 52W:** 0.382 {fp(c['fib']['ret'][0.382])} · 0.618 {fp(c['fib']['ret'][0.618])} · 0.786 {fp(c['fib']['ret'][0.786])} · High {fp(c['fib']['hi52'])}
+- **Risk:** Vol {r['vol_ann'] * 100:.0f}%/ปี (cap {cap_for(c):.0f}%) · MDD 1Y {r['mdd_1y'] * 100:.0f}% · Beta {r['beta']:.2f} · RS90 vs BTC {fpct(r['rs90'])}
+- **พื้นฐาน:** Rank #{f.get('rank', '-')} · MCap {fbig(f.get('mcap'))} · FDV/MCap {fdvm} · ห่าง ATH {fpct(f.get('ath_dist'), 0)} · TVL {fbig(f.get('tvl'))} · Fees 30D {fbig(f.get('fees30d'))} · P/F {pf}
+{proj}
+{bb}
+
+**ข่าว 30 วัน**
+{news}
+
+**กำหนดการ 6 เดือน**
+{ev}
+</details>
+
+---
+"""
+
+
+def summary_text(res: dict, coins: list[dict], port: dict) -> str:
+    m = res["macro"]
+    fng = res["fng"]
+    reg = {"Bull": "🟢 Bull", "Bear": "🔴 Bear", "Neutral": "🟡 Neutral"}[m["regime"]]
+    L = [f"🧠 Crypto Spot Brief {res['ts']:%d/%m %H:%M}",
+         f"Macro {reg} | BTC {fp(m['btc_price'])}" + (f" | F&G {fng['value']}" if fng else ""), ""]
+    cb = {c["ticker"]: c for c in coins}
+    sigs = res.get("signals") or []
+    if sigs:
+        L.append("🚦 สัญญาณ (ผ่านเกณฑ์คุณภาพ)")
+        for s in sigs:
+            L.append(f"• {s.ticker} ซื้อ {fp(s.entry_lo)}–{fp(s.entry_hi)} | SL {fp(s.sl)} | TP {fp(s.tp1)} | "
+                     f"คะแนน {s.confidence:.0f} | TP ก่อน SL {s.win_prob or 0:.0f}%")
+    med = [p for p in port["picks"] if p["horizon"] == "MEDIUM"]
+    lng = [p for p in port["picks"] if p["horizon"] == "LONG"]
+    if med:
+        L.append("⏱ ระยะกลาง")
+        for p in med:
+            x = cb[p["ticker"]]["med"]
+            ft = x["ft1"] or {}
+            L.append(f"• {p['ticker']} {x['status']}{(cb[p['ticker']].get('news') or {}).get('emoji', '')} "
+                     f"ซื้อ {fp(x['zone'][0])}–{fp(x['zone'][1])} | SL {fp(x['sl'])} | "
+                     f"TP {fp(x['tp1'])}/{fp(x['tp2'])} | ถึงก่อน SL {fprob(ft.get('p_tp'))} | {p['alloc_final']:.0f}%")
+    if lng:
+        L.append("🏦 ระยะยาว (DCA)")
+        for p in lng:
+            x = cb[p["ticker"]]["long"]
+            L.append(f"• {p['ticker']} {x['status']} " + "/".join(fp(t) for t in x["tiers"]) +
+                     f" | TP {fp(x['tp1'])}/{fp(x['tp2'])} | Stop W<{fp(x['stop'])} | {p['alloc_final']:.0f}%")
+    others = [c for c in coins if c["ticker"] not in {p["ticker"] for p in port["picks"]}]
+    if others:
+        L.append("👀 เฝ้าดู")
+        for c in others[:6]:
+            L.append(f"• {c['ticker']} {c['med']['status']}/{c['long']['status']} {fp(c['price'])} — "
+                     f"{' · '.join(rule_verdict(c).split(' · ')[:2])}")
+    L += ["", f"💵 เงินสด {port['cash']:.0f}%", "⚠️ ไม่ใช่คำแนะนำการลงทุน"]
+    return "\n".join(L)
+
+
+def full_report_md(res: dict, coins, research, views, pick_by, final_win, capital, risk_pct, md_table) -> str:
+    macro, port = res["macro"], res["port"]
+    return (f"# Crypto AI Lab Report — {res['ts']:%d %b %Y %H:%M} (UTC+7)\n\n"
+            f"Macro {macro['regime']} · BTC {fp(macro['btc_price'])} · Cash {port['cash']:.0f}%\n\n"
+            "## 1. 📊 ตารางสรุป\n\n### ⏱ ระยะกลาง\n\n" + md_table(table_medium(coins, research, final_win)) +
+            "\n\n### 🏦 ระยะยาว\n\n" + md_table(table_long(coins, research, final_win)) +
+            "\n\n### 🧪 Backtest\n\n" + md_table(table_backtest(coins)) +
+            "\n\n## 2. 🔍 บทวิเคราะห์รายเหรียญ\n\n" +
+            "\n".join(deep_dive_md(c, research, views, pick_by, capital, risk_pct, res.get("news")) for c in coins) +
+            "\n\n> ⚠️ เพื่อการศึกษา ไม่ใช่คำแนะนำการลงทุน")
+
+
+def symbol_of(ticker: str) -> str:
+    return f"{ticker}{QUOTE}"
+
+
+def ts_th(ts: datetime) -> str:
+    return ts.strftime("%d/%m %H:%M")
+
+
+# ════════════════════ pipeline ════════════════════
+log = logging.getLogger(__name__)
+Progress = Callable[[str], None]
+
+
+def _noop(_: str) -> None:
+    pass
+
+
+@dataclass
+class RunConfig:
+    watch: list[str]
+    n_extra: int = 5
+    horizon: int = 30        # กรอบเวลาที่สนใจ (วัน) ใช้จัดอันดับโอกาสและให้ AI คัดเหรียญ
+    min_qvol: float = 20e6
+    cg_key: str = ""
+    client: object | None = None
+    model: str = "gemini-2.5-flash"
+    model_research: str = "gemini-2.5-flash"
+    n_research: int = 8
+    n_med: int = 3
+    n_long: int = 3
+    use_news: bool = True
+    news_w: float = 8.0
+    holdings: list[str] = field(default_factory=list)
+    research_cache: dict = field(default_factory=dict)
+    ai_agents: bool = True   # Research + Strategist + Risk Manager (ปิดใน scan_job เพื่อประหยัดโควต้า)
+    news_ai: bool = True     # ใช้ AI วิเคราะห์ Sentiment (ปิด = keyword)
+
+
+# ───────────────────────── Market Scanner ─────────────────────────
+def detect_setups(d: pd.DataFrame) -> list[str]:
+    """ตรวจจับ Volume Spike / Breakout / Trend Reversal / Momentum จากแท่งปิดล่าสุด"""
+    if len(d) < 60:
+        return []
+    x, p = d.iloc[-1], d.iloc[-2]
+    tags = []
+    if x.vol_ratio >= 2.5:
+        tags.append(f"Volume Spike {x.vol_ratio:.1f}x")
+    hh20 = d["high"].iloc[-21:-1].max()
+    if x.close > hh20 and x.vol_ratio >= 1.3:
+        tags.append("Breakout 20 แท่ง")
+    if p.ema20 <= p.ema50 and x.ema20 > x.ema50:
+        tags.append("EMA20 ตัดขึ้น EMA50")
+    if p.macd_h <= 0 < x.macd_h and x.rsi < 55:
+        tags.append("MACD กลับตัวขึ้น")
+    if 55 <= x.rsi <= 70 and x.adx >= 25 and x.pdi > x.mdi:
+        tags.append(f"Momentum (ADX {x.adx:.0f})")
+    return tags
+
+
+def scan_universe(md: MarketData, exclude: set[str], n: int, min_qvol: float, top: int = 60,
+                  progress: Callable[[float, str], None] | None = None) -> tuple[list[str], dict[str, list[str]]]:
+    """คัดเหรียญเพิ่มจาก Top volume · คืน (symbols, tags รายเหรียญ)"""
+    t = md.tickers()
+    t = t[~t["base"].isin(STABLES | exclude) & ~t["base"].str.endswith(("UP", "DOWN", "BULL", "BEAR"))]
+    t = t[(t["quoteVolume"] >= min_qvol) & (t["count"] > 20_000)].sort_values("quoteVolume", ascending=False).head(top)
+    if t.empty:
+        return [], {}
+    fr = fetch_frames(md, list(t.index), ("1d",), progress)
+    rows, tags = [], {}
+    for s, f in fr.items():
+        if "1d" not in f or len(f["1d"]) < 120:
+            continue
+        d = closed_only(add_indicators(f["1d"]))
+        last = d.iloc[-1]
+        vr = t.loc[s, "quoteVolume"] / max(d["qvol"].iloc[-20:].mean(), 1)
+        sc = 2 * min(vr, 3) + (45 <= last.rsi <= 70) + (last.close > last.ema50) + (last.macd_h > 0)
+        sc += bool(not np.isnan(last.ema200) and last.close > last.ema200)
+        tg = detect_setups(d)
+        pats = chart_patterns(d)
+        tg += [f"{p['name']} ({p['state']})" for p in pats if p["bias"] == "bull"]
+        sc += 0.5 * len(tg) - sum(p["bias"] == "bear" for p in pats)
+        tags[s] = tg
+        rows.append((s, sc))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in rows[:n]], tags
+
+
+def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = None) -> pd.DataFrame:
+    """จัดอันดับเหรียญที่มีโอกาสขึ้นในกรอบเวลา horizon วัน (ตัวเลขจากสถิติ + เหตุผลประกอบ)
+
+    คะแนนโอกาส = 40% โอกาสปิดสูงกว่าวันนี้ + 25% upside ที่มีโอกาส 50% แตะ (ปรับด้วยความผันผวน)
+                 + 15% สถานะจุดเข้า + 10% รูปแบบกราฟ + 10% ข่าว/อีเวนต์ — ไม่ใช่การรับประกัน
+    """
+    H = min((h for h in (7, 14, 30, 60, 90, 180) if h >= horizon), default=180)
+    rows = []
+    for c in coins:
+        v = c["fc"].get(H)
+        if not v:
+            continue
+        up50 = v["reach50"] / c["price"] - 1
+        dn50 = v["dip50"] / c["price"] - 1
+        rr = up50 / max(-dn50, 1e-6)
+        news = (c.get("news") or {})
+        rd = ((research or {}).get(c["ticker"]) or {}).get("data") or {}
+        cat = (rd.get("catalyst_score") or 0) / 100
+        pattern_score = sum({"bull": 1, "bear": -1}.get(p["bias"], 0) for p in c.get("patterns", []))
+        s = 40 * v["p_up"] + 25 * float(np.clip(rr / 2, 0, 1)) + 15 * {"🟢": 1, "🟡": 0.5, "🔴": 0}[c["med"]["status"]]
+        s += 10 * float(np.clip(0.5 + pattern_score / 4, 0, 1))
+        s += 10 * float(np.clip(0.5 + news.get("score", 0) * news.get("confidence", 0) + cat / 2, 0, 1))
+        why = [f"{p['name']} {p['state']}" for p in c.get("patterns", []) if p["bias"] == "bull"]
+        why += c.get("scan_tags", [])[:2]
+        if news.get("score", 0) >= 0.12:
+            why.append(f"ข่าวบวก {news['score']:+.2f}")
+        if cat > 0.2:
+            why.append(f"อีเวนต์โปรเจกต์ +{cat * 100:.0f}")
+        if c["med"]["status"] == "🟢":
+            why.append("อยู่ในโซนซื้อ")
+        warn = [f"{p['name']} ({BIAS_TH['bear']})" for p in c.get("patterns", []) if p["bias"] == "bear"]
+        if c["cf"]["regime"] == "DOWN":
+            warn.append("Regime ขาลง")
+        if news.get("score", 0) <= -0.12:
+            warn.append(f"ข่าวลบ {news['score']:+.2f}")
+        rows.append({"Ticker": ("⭐" if c.get("is_pick") else "") + c["ticker"], "คะแนนโอกาส": round(float(s)),
+                     f"โอกาสปิดสูงกว่าวันนี้ใน {H} วัน": fprob(v["p_up"]),
+                     "50% แตะ ≥": f"{fp(v['reach50'])} ({fpct(up50)})", "30% แตะ ≥": f"{fp(v['reach30'])} ({dist(c, v['reach30'])})",
+                     "ย่อลึก (50%)": f"{fp(v['dip50'])} ({fpct(dn50)})",
+                     "จุดเข้า": f"{c['med']['status']} {fp(c['med']['zone'][0])}–{fp(c['med']['zone'][1])}",
+                     "เหตุผล": " · ".join(why) or "-", "ข้อควรระวัง": " · ".join(warn) or "-",
+                     "ตัวอย่างอิสระ": v["n_eff"]})
+    df = pd.DataFrame(rows)
+    return df.sort_values("คะแนนโอกาส", ascending=False).reset_index(drop=True) if len(df) else df
+
+
+def table_patterns(coins: list[dict]) -> pd.DataFrame:
+    rows = [{"Ticker": c["ticker"], "รูปแบบ": p["name"], "ทิศทาง": BIAS_TH[p["bias"]], "สถานะ": p["state"],
+             "ระดับสำคัญ": fp(p["level"]), "เป้าตามรูปแบบ": f"{fp(p['target'])} ({dist(c, p['target'])})",
+             "โอกาสแตะเป้าใน 60 วัน (สถิติ)": fprob(p.get("p_target_60")), "รายละเอียด": p["note"]}
+            for c in coins for p in c.get("patterns", [])]
+    return pd.DataFrame(rows)
+
+
+# ───────────────────────── News ─────────────────────────
+def apply_news(coins: list[dict], report: dict, weight: float) -> None:
+    """Sentiment (score × confidence) ปรับคะแนน ±weight · ข่าวลบแรง → ห้ามระยะกลาง"""
+    smap = na.news_score_map(report)
+    for c in coins:
+        c["news"] = report["coins"].get(c["ticker"])
+        adj = float(np.clip(smap.get(c["ticker"], 0.0) * weight, -weight, weight))
+        c["score_base"], c["news_adj"] = c["score"], adj
+        c["score"] = float(np.clip(c["score"] + adj, 0, 100))
+        c["news_block"] = na.is_strong_negative(report, c["ticker"])
+
+
+def btc_context(md: MarketData, cg_key: str, frames: dict | None = None) -> tuple[pd.DataFrame, dict, dict]:
+    """คืน (btc_d แท่งปิดแล้ว, macro, glob)"""
+    b = (frames or {}).get(f"BTC{QUOTE}") or fetch_frames(md, [f"BTC{QUOTE}"], ("1d", "1w"))[f"BTC{QUOTE}"]
+    btc_d = closed_only(add_indicators(b["1d"]))
+    btc_w = closed_only(add_indicators(b["1w"]))
+    glob = cg_global(cg_key)
+    macro = macro_agent(btc_d, btc_w, glob, fear_greed())
+    macro["btc_price"] = float(b["1d"]["close"].iloc[-1])
+    return btc_d, macro, glob
+
+
+# ───────────────────────── Full pipeline ─────────────────────────
+def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
+                 bar: Callable[[float, str], None] | None = None) -> dict:
+    t0 = time.perf_counter()
+    progress("📡 Market Data Agent: ตรวจรายชื่อคู่เทรด…")
+    valid = set(md.tickers().index)
+    watch = [w for w in cfg.watch if f"{w}{QUOTE}" in valid]
+    missing = [w for w in cfg.watch if f"{w}{QUOTE}" not in valid]
+    extra, scan_tags = ([], {})
+    if cfg.n_extra:
+        progress("🔎 Market Scanner: คัดเหรียญจาก Volume สูงสุด…")
+        extra, scan_tags = scan_universe(md, set(watch) | {"BTC"}, cfg.n_extra, cfg.min_qvol, progress=bar)
+    syms = list(dict.fromkeys([f"BTC{QUOTE}", *[f"{w}{QUOTE}" for w in watch], *extra]))
+    progress("📡 Market Data Agent: ดึง 4H/1D/1W แบบขนาน…")
+    frames = fetch_frames(md, syms, ("4h", "1d", "1w"), bar)
+    if "1d" not in frames.get(f"BTC{QUOTE}", {}) or "1w" not in frames.get(f"BTC{QUOTE}", {}):
+        raise RuntimeError("ดึงข้อมูล BTC ไม่ได้ — ระงับการวิเคราะห์ (ข้อมูลไม่เพียงพอ)")
+
+    progress("🏛 Fundamental + Macro Agent…")
+    tickers = tuple(s[: -len(QUOTE)] for s in syms)
+    ext = external_bundle(tickers, cfg.cg_key)
+    cg, glob, llama, rss, det = ext["cg"], ext["glob"], ext["llama"], ext["rss"], ext["det"]
+    fng = fear_greed()
+    btc_d = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1d"]))
+    btc_w = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1w"]))
+    macro = macro_agent(btc_d, btc_w, glob, fng)
+    macro["btc_price"] = float(frames[f"BTC{QUOTE}"]["1d"]["close"].iloc[-1])
+
+    progress("📐 Structure + Quant + Forecast Agent…")
+    coins, skipped = [], []
+    for s in syms:
+        t = s[: -len(QUOTE)]
+        fund = fundamentals_for(t, cg.get(t), det.get((cg.get(t) or {}).get("id")), llama)
+        try:
+            c = analyze_coin(s, frames.get(s, {}), btc_d, macro, fund)
+        except Exception as e:  # noqa: BLE001 — เหรียญเดียวพังไม่ล้มทั้งระบบ
+            log.exception("analyze %s", s)
+            skipped.append(f"{t}: {e}")
+            continue
+        if c:
+            c["is_pick"] = s in extra
+            c["scan_tags"] = scan_tags.get(s, [])
+            coins.append(c)
+        else:
+            skipped.append(f"{t}: ข้อมูลไม่พอ")
+
+    news = {"items": [], "src": {}, "report": {"overall": "", "themes": [], "coins": {}}, "mode": "off", "focus": []}
+    if cfg.use_news and coins:
+        progress("📰 News Agent: ดึงข่าว 6 เว็บ + Google News รายเหรียญ…")
+        try:
+            hold = [h for h in cfg.holdings if h]
+            names = {c["ticker"]: c["fund"].get("name") for c in coins if c["fund"].get("name")}
+            sym_all = list(dict.fromkeys([c["ticker"] for c in coins] + hold))
+            focus = list(dict.fromkeys([c["ticker"] for c in coins if c["is_pick"]] + watch + hold))
+            items, src = na.collect_news(sym_all, names, focus, days=7)
+            progress("📰 News Agent: วิเคราะห์ Sentiment…")
+            report, nmode = na.analyze_news(items, sym_all, llm=llm_fn(cfg.client, cfg.model_research) if cfg.news_ai else None,
+                                             focus=focus)
+            news = {"items": items, "src": src, "report": report, "mode": nmode, "focus": focus}
+            apply_news(coins, report, cfg.news_w)
+        except Exception as e:  # noqa: BLE001
+            news["error"] = str(e)[:200]
+    d1s = {c["symbol"]: c["d1"] for c in coins}
+    corr = corr_matrix(d1s)
+    base = [c for c in coins if not c["is_pick"] and (c["ticker"] != "BTC" or "BTC" in cfg.watch)]
+    analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
+
+    signals, watch_only = [], []
+    for c in analyzed:
+        sig, fails = build_signal(c, macro, c.get("news"), bool(c.get("news_block")))
+        c["gate_fails"] = fails
+        if sig:
+            signals.append(sig)
+        elif c["med"]["status"] != "🔴":
+            watch_only.append(c["ticker"])
+
+    research = {"by_ticker": {}, "log": []}
+    if cfg.client and cfg.ai_agents:
+        short = sorted(analyzed, key=lambda c: c["score"], reverse=True)[: cfg.n_research]
+        research = research_agent(cfg.client, cfg.model_research, short, cfg.research_cache, progress,
+                                  news["items"], na.headlines,
+                                  lambda c: [f"{x['date']} {x['src']}: {x['title']}"
+                                             for x in rss_for(c["ticker"], c["fund"].get("name"), rss)])
+        port = strategist_and_risk(cfg.client, cfg.model, analyzed, research["by_ticker"], macro, corr,
+                                   cfg.n_med, cfg.n_long, progress, cfg.horizon)
+    else:
+        picks = fallback_strategy(analyzed, cfg.n_med, cfg.n_long)
+        port = {"picks": picks, "cash": 100 - sum(p["alloc_final"] for p in picks), "strategist": None, "views": {},
+                "risk": None, "errors": [], "mode": "rule-based (ไม่มี API key)"}
+
+    return {"coins": analyzed, "macro": macro, "glob": glob, "fng": fng, "corr": corr, "research": research,
+            "port": port, "missing": missing, "skipped": skipped, "rss": rss, "news": news,
+            "signals": signals, "watch_only": watch_only,
+            "elapsed": time.perf_counter() - t0, "btc_d": btc_d, "ts": datetime.now(TZ_TH), "host": md.host}
+
+
+def run_portfolio(md: MarketData, holds_in: list[dict], res: dict | None, client, model: str, cg_key: str,
+                  use_news: bool) -> dict:
+    if res:
+        btc_d, macro = res["btc_d"], res["macro"]
+    else:
+        btc_d, macro, _ = btc_context(md, cg_key)
+    coins = {c["ticker"]: c for c in (res or {}).get("coins", [])}
+    tick = [h["ticker"] for h in holds_in]
+    need = [t for t in tick if t not in coins]
+    errors: list[str] = []
+    if need:
+        fr = fetch_frames(md, [f"{t}{QUOTE}" for t in need], ("4h", "1d", "1w"))
+        ext = external_bundle(tuple(need), cg_key)
+        for t in need:
+            cg = ext["cg"].get(t)
+            fund = fundamentals_for(t, cg, ext["det"].get((cg or {}).get("id")), ext["llama"])
+            try:
+                cc = analyze_coin(f"{t}{QUOTE}", fr.get(f"{t}{QUOTE}", {}), btc_d, macro, fund)
+            except Exception as e:  # noqa: BLE001
+                cc = None
+                errors.append(f"{t}: {e}")
+            if cc:
+                coins[t] = cc
+            else:
+                errors.append(f"{t}: ไม่พบคู่ {QUOTE} บน Binance หรือข้อมูลไม่พอ")
+    news = (res or {}).get("news") or {}
+    report = news.get("report") or {"coins": {}}
+    miss_news = [t for t in tick if t in coins and t not in report.get("coins", {})]
+    if use_news and miss_news:
+        try:
+            names = {t: coins[t]["fund"].get("name") for t in miss_news if coins[t]["fund"].get("name")}
+            items, _ = na.collect_news(miss_news, names, miss_news, days=7)
+            rep2, _ = na.analyze_news(items, miss_news, llm=llm_fn(client, model), focus=miss_news)
+            report = {**report, "coins": {**report.get("coins", {}), **rep2["coins"]}}
+            news = {**news, "items": (news.get("items") or []) + items, "report": report}
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"ข่าว: {str(e)[:120]}")
+    holds = []
+    for h in holds_in:
+        c = coins.get(h["ticker"])
+        if c:
+            holds.append(holding_plan(c, h["qty"], h["cost"], report.get("coins", {}).get(h["ticker"])))
+            c.pop("_fc", None)
+    corr = corr_matrix({coins[h["ticker"]]["symbol"]: coins[h["ticker"]]["d1"] for h in holds}) if len(holds) > 1 \
+        else pd.DataFrame()
+    review, ai_err = (portfolio_ai(client, model, holds, coins, macro, corr) if (client and holds) else (None, []))
+    vmap = {v.ticker: v for v in (review.holdings if review else [])}
+    for h in holds:
+        v = vmap.get(h["ticker"])
+        h["act_ai"] = v.action if v else None
+        h["act"] = enforce_holding_ai(h, v)
+        h["view"] = v.model_dump() if v else None
+    return {"holds": holds, "review": review, "corr": corr, "errors": errors + ai_err, "news": news,
+            "macro": macro, "ts": datetime.now(TZ_TH)}
