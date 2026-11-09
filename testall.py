@@ -647,3 +647,14 @@ def test_final_verdict_and_home(fake_md):
     v = final_verdict(c, res["deep"]["data"])
     assert v["action"][:1] in ("✅", "⏳", "⛔") and v["reasons"] and 0 <= v["score"] <= 100
     assert c["score_check"] is not None
+
+
+def test_plotly_charts_have_unique_keys():
+    """กราฟที่อาจเหมือนกัน 2 ที่ในหน้าเดียว → Streamlit ขึ้น DuplicateElementId ถ้าไม่มี key"""
+    import re
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"), encoding="utf-8").read()
+    calls = re.findall(r"st\.plotly_chart\((.*)\)", src)
+    keys = [re.search(r'key="([^"]+)"', c) for c in calls]
+    assert calls and all(keys), "ทุก st.plotly_chart ต้องมี key"
+    names = [k.group(1) for k in keys]
+    assert len(names) == len(set(names))
