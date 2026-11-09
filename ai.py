@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from pydantic import BaseModel, ValidationError
 from typing import Callable, Literal
-from config import MAJORS, MODEL_FALLBACK, QUOTE, REG_TH, RESEARCH_TTL, TZ_TH
+from config import AUTO_MODEL, MAJORS, MODEL_FALLBACK, QUOTE, REG_TH, RESEARCH_TTL, TZ_TH
 from analysis import cap_for, rel_win
 
 
@@ -127,11 +127,42 @@ class SignalNotes(BaseModel):
 _SKIP_MODEL = ("404", "NOT_FOUND", "not found", "is not supported", "deprecated", "RESOURCE_EXHAUSTED", "quota")
 
 
+_DISCOVERED: list[str] = []
+_SKIP_NAME = ("image", "tts", "live", "embedding", "audio", "robotics", "computer-use", "nano", "gemma", "aqa", "learnlm",
+              "veo", "imagen", "omni")
+
+
+def _model_rank(name: str) -> tuple:
+    """เรียงโมเดล: เวอร์ชันใหม่ก่อน · stable ก่อน preview · flash > pro > lite (เร็ว/ถูก/โควต้าเยอะ)"""
+    v = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    ver = float(v.group(1)) if v else 0.0
+    tier = 0 if ("flash" in name and "lite" not in name) else (1 if "pro" in name else 2)
+    return (-ver, "preview" in name or "exp" in name, tier, name)
+
+
+def discover_models(client) -> list[str]:
+    """ถาม Gemini API ว่าตอนนี้มีโมเดลไหนที่ใช้ generateContent ได้ (กันโมเดลถูกปิดแล้วแอปพัง)"""
+    out = []
+    try:
+        for m in client.models.list():
+            n = (getattr(m, "name", "") or "").split("/")[-1]
+            acts = getattr(m, "supported_actions", None) or []
+            if "gemini" not in n or any(x in n for x in _SKIP_NAME) or (acts and "generateContent" not in acts):
+                continue
+            out.append(n)
+    except Exception as e:  # noqa: BLE001
+        log.warning("list models failed: %s", e)
+    return sorted(set(out), key=_model_rank)
+
+
 def make_client(api_key: str):
-    """คืน client หรือ None (ไม่มี key / ไม่มีไลบรารี)"""
+    """คืน client หรือ None (ไม่มี key / ไม่มีไลบรารี) · ค้นหาโมเดลที่ใช้ได้ครั้งเดียวต่อโปรเซส"""
     if not api_key or genai is None:
         return None
-    return genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key)
+    if not _DISCOVERED:
+        _DISCOVERED.extend(discover_models(client))
+    return client
 
 
 def _retry(fn, tries: int = 3):
@@ -173,7 +204,9 @@ def _sources(resp) -> list[dict]:
 
 
 def model_chain(primary: str) -> list[str]:
-    return list(dict.fromkeys([primary, *MODEL_FALLBACK]))
+    """โมเดลที่เลือก → โมเดลที่ค้นเจอว่าใช้ได้จริง (ใหม่สุดก่อน) → alias -latest"""
+    base = [] if (not primary or primary == AUTO_MODEL) else [primary]
+    return list(dict.fromkeys(base + _DISCOVERED[:4] + MODEL_FALLBACK))
 
 
 def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search: bool):
