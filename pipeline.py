@@ -18,6 +18,8 @@ from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, m
 from config import (FEE, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
                     STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
 from analysis import technical_votes
+from ai import coin_brief, enforce_horizon_views, focus_ai, project_deep_agent
+from deep import deep_analysis, deep_brief, horizon_outlook, peers_for, score_check
 from analysis import (BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent,
                       momentum_profile, touch_prob, xs_momentum_backtest, xs_rank)
 from sources import cg_global, external_bundle, fear_greed, fundamentals_for, rss_for
@@ -514,8 +516,11 @@ def _noop(_: str) -> None:
 
 @dataclass
 class RunConfig:
-    watch: list[str]         # เหรียญที่ผู้ใช้สนใจ (ใช้แค่ MAX_WATCH ตัวแรก)
+    watch: list[str]         # เหรียญที่ผู้ใช้สนใจ (ใช้แค่ max_watch ตัวแรก · ตัวแรก = เจาะลึก)
     n_extra: int = SCAN_DEFAULT_EXTRA
+    max_watch: int = MAX_WATCH
+    deep: bool = True        # วิเคราะห์เจาะลึกเหรียญตัวแรก (1H-1W · 6 กลยุทธ์ · คู่แข่ง)
+    news_items: list = field(default_factory=list)  # ข่าวที่เก็บได้ในรอบนี้ (ใช้ใน Deep dive)
     horizon: int = 30        # กรอบเวลาที่สนใจ (วัน) ใช้จัดอันดับโอกาสและให้ AI คัดเหรียญ
     min_qvol: float = 20e6
     cg_key: str = ""
@@ -719,6 +724,8 @@ def parse_event_date(s: str) -> tuple[pd.Timestamp | None, bool]:
         q = re.fullmatch(r"(\d{4})-?Q([1-4])", s, re.I)
         if q:
             return pd.Timestamp(f"{q.group(1)}-{3 * int(q.group(2)) - 2:02d}-01"), True
+        if re.fullmatch(r"\d{4}", s):  # ระบุแค่ปี → ประมาณกลางปี
+            return pd.Timestamp(f"{s}-07-01"), True
     except ValueError:
         pass
     return None, True
@@ -776,11 +783,14 @@ def entry_points(c: dict) -> float:
 
 
 def buy_score_sys(c: dict) -> float:
-    """คะแนนควรซื้อของระบบ 0-100 = เทคนิคเห็นตรงกัน 35% + โอกาสขึ้น (สถิติ) 35% + สถานะจุดเข้า 15% + ข่าว/อีเวนต์ 15%"""
+    """คะแนนควรซื้อของระบบ 0-100 = เทคนิค 35% + โอกาสขึ้น 35% + สถานะจุดเข้า 15% + ข่าว/อีเวนต์ 15%
+    ถ้าทดสอบย้อนหลังแล้วเทคนิคทำนายเหรียญนี้ไม่ได้ → เทคนิค 15% / โอกาสขึ้น 55%"""
     n = c.get("news") or {}
     news = 0.5 * n.get("score", 0) * n.get("confidence", 0) + 0.5 * c.get("event_net", 0.0)
     p_up = c.get("p_up_h")
-    s = 0.35 * c["tech"]["score"] + 0.35 * (p_up * 100 if p_up is not None else 50) + 0.15 * entry_points(c)
+    ck = c.get("score_check")
+    w_tech = 0.15 if (ck is not None and not ck["ok"]) else 0.35  # เทคนิคทำนายเหรียญนี้ไม่ได้ → ลดน้ำหนัก
+    s = w_tech * c["tech"]["score"] + (0.70 - w_tech) * (p_up * 100 if p_up is not None else 50) + 0.15 * entry_points(c)
     s += 0.15 * (50 + 50 * float(np.clip(news, -1, 1)))
     return float(np.clip(s, 0, 100))
 
@@ -793,6 +803,40 @@ def outlook_label(c: dict) -> str:
     if s <= 42 or (t["bear"] > t["bull"] and p < 0.5):
         return "🔴 ลบ"
     return "⚪ กลาง"
+
+
+def final_verdict(c: dict, deep: dict | None = None) -> dict:
+    """คำตอบเดียวสำหรับหน้าแรก: ซื้อ / รอ / เลี่ยง + ราคา + เหตุผล 3 ข้อ (ทุกตัวเลขมาจากระบบ)"""
+    m = c["med"]
+    fails = c.get("gate_fails") or []
+    score = c.get("buy_final", c.get("buy_sys", 50))
+    if not fails and score >= 55:
+        act, color = "✅ ซื้อได้", "green"
+        line = f"ตั้ง Limit {fp(m['zone'][0])} – {fp(m['zone'][1])} · SL {fp(m['sl'])} · TP1 {fp(m['tp1'])} · TP2 {fp(m['tp2'])}"
+    elif m["status"] == "🔴" or score < 40:
+        act, color = "⛔ ยังไม่ควรซื้อ", "red"
+        line = f"แนวโน้มยังไม่เอื้อ · ถ้าจะสะสมระยะยาว DCA เริ่ม {fp(c['long']['tiers'][0])} ตัดขาดทุน Weekly < {fp(c['long']['stop'])}"
+    else:
+        act, color = "⏳ รอจังหวะ", "orange"
+        line = f"ตั้งรอซื้อ {fp(m['zone'][0])} – {fp(m['zone'][1])} เมื่อผ่านเงื่อนไข: " + (" · ".join(fails[:2]) or "4H กลับตัว")
+    pos = [x for x in c["tech"]["votes"] if x["vote"] > 0]
+    neg = [x for x in c["tech"]["votes"] if x["vote"] < 0]
+    reasons = []
+    if pos:
+        reasons.append("🟢 " + " · ".join(f"{x['name']} ({x['detail']})" for x in pos[:3]))
+    if neg:
+        reasons.append("🔴 " + " · ".join(f"{x['name']} ({x['detail']})" for x in neg[:3]))
+    sig = next((x for x in (deep or {}).get("signals", []) if x["bias"] != 0), None)
+    if sig:
+        reasons.append(f"🔮 {sig['signal']} · {sig['when']}" + (f" · ระดับ {sig['trigger']}" if sig["trigger"] != "-" else ""))
+    ck = c.get("score_check")
+    acc = None
+    if ck:
+        acc = (f"{ck['verdict']} · ทดสอบ {ck['n_test']} วันล่าสุด ทายทิศถูก "
+               + (f"{ck['hit'] * 100:.0f}%" if ck["hit"] is not None else "-")
+               + f" · วันที่คะแนนใกล้วันนี้ ขึ้นจริง {ck['p_today'] * 100:.0f}% (n≈{ck['n_today']})")
+    return {"action": act, "color": color, "line": line, "reasons": reasons, "score": score,
+            "p_up": c.get("p_up_h"), "accuracy": acc}
 
 
 def decision_table(coins: list[dict], views: dict, horizon: int) -> pd.DataFrame:
@@ -814,6 +858,7 @@ def decision_table(coins: list[dict], views: dict, horizon: int) -> pd.DataFrame
             "เทคนิค บวก/ลบ/กลาง": f"{t['bull']} / {t['bear']} / {t['neutral']}",
             "✅ เทคนิคที่บวก": " · ".join(pos) or "-", "❌ เทคนิคที่ลบ": " · ".join(neg) or "-",
             "ข่าวข้างหน้า": f"{c.get('event_net', 0):+.2f}",
+            "ทดสอบคะแนนย้อนหลัง": (c.get("score_check") or {}).get("verdict", "—").split(" ")[0],
             "AI สรุปจากเทคนิค": " · ".join(v.get("key_techniques") or []) or "-"})
     return pd.DataFrame(rows)
 
@@ -865,9 +910,13 @@ def analysis_export_df(res: dict, horizon: int) -> pd.DataFrame:
     ts = res["ts"]
     H = horizon_bucket(horizon)
     views = (res.get("port") or {}).get("views") or {}
+    dp = res.get("deep") or {}
+    dd = dp.get("data") or {}
+    best = ((dd.get("lab") or {}).get("best") or {})
     rows = []
     for c in res["coins"]:
         m, l = c["med"], c["long"]
+        is_focus = c["ticker"] == dp.get("focus")
         n = c.get("news") or {}
         rows.append({
             "run_ts_utc": pd.Timestamp(ts).tz_convert("UTC").isoformat(), "run_date_th": ts.strftime("%Y-%m-%d"),
@@ -887,7 +936,18 @@ def analysis_export_df(res: dict, horizon: int) -> pd.DataFrame:
             "news_score": n.get("score"), "event_net": c.get("event_net"),
             "bt_n": c["bt"]["n"], "bt_expectancy": c["bt"]["expectancy"], "bt_oos_expectancy": c["bt"]["oos_expectancy"],
             "long_status": l["status"], "dca1": l["tiers"][0], "dca2": l["tiers"][1], "dca3": l["tiers"][2],
-            "long_stop": l["stop"], "long_tp1": l["tp1"]})
+            "long_stop": l["stop"], "long_tp1": l["tp1"], "is_focus": is_focus,
+            "score_test": (c.get("score_check") or {}).get("verdict"),
+            "score_test_skill": (c.get("score_check") or {}).get("skill"),
+            "score_test_p_today": (c.get("score_check") or {}).get("p_today"),
+            "mtf_alignment": dd.get("alignment") if is_focus else None,
+            "best_strategy": best.get("name") if is_focus else None,
+            "best_strategy_in_pos": best.get("now") if is_focus and best else None,
+            "peer_rank": f"{dd['peers']['rank']}/{dd['peers']['n']}" if is_focus and dd.get("peers") else None,
+            **({f"hz_{h['H']}d_score": round(h["score"], 1) for h in dd.get("horizons", [])} if is_focus else {}),
+            **({f"hz_{h['H']}d_p_up": h["p_up"] for h in dd.get("horizons", [])} if is_focus else {}),
+            **({f"hz_{h['H']}d_ai": (dp.get("horizon_ai") or {}).get(h["label"], {}).get("score")
+                for h in dd.get("horizons", [])} if is_focus else {})})
     return pd.DataFrame(rows)
 
 
@@ -998,6 +1058,45 @@ def btc_context(md: MarketData, cg_key: str, frames: dict | None = None) -> tupl
     return btc_d, macro, glob
 
 
+# ───────────────────────── Deep dive (1 เหรียญ) ─────────────────────────
+def run_deep(md: MarketData, cfg: RunConfig, c: dict, raw: dict, research: dict, roadmap: list[dict]) -> dict:
+    """เจาะลึกเหรียญเดียว: ดึง 1H เพิ่ม + 1D ของคู่แข่ง → deep_analysis → (AI) บทวิเคราะห์ + สถานการณ์"""
+    t = c["ticker"]
+    raw = dict(raw)
+    peers = peers_for(t)
+    extra = fetch_frames(md, [c["symbol"]] + [f"{p}{QUOTE}" for p in peers], ("1d",))
+    h1 = fetch_frames(md, [c["symbol"]], ("1h",)).get(c["symbol"], {}).get("1h")
+    if h1 is not None:
+        raw["1h"] = h1
+    peer_d1 = {}
+    for p in peers:
+        d = (extra.get(f"{p}{QUOTE}") or {}).get("1d")
+        if d is not None and len(d) >= 120:
+            peer_d1[p] = closed_only(add_indicators(d))
+    data = deep_analysis(c, raw, peer_d1)
+    report, errs, project, proj_rows = None, [], None, []
+    if cfg.client and cfg.ai_agents:
+        heads = na.headlines(cfg.news_items, t, 8) if cfg.news_items else []
+        project = project_deep_agent(cfg.client, cfg.model_research, c, cfg.research_cache, heads)
+        pdat = (project or {}).get("data") or {}
+        cert = {"DONE": "CONFIRMED", "IN_PROGRESS": "EXPECTED", "PLANNED": "EXPECTED", "RUMOR": "RUMOR"}
+        ev = [{"date": x["period"], "type": x["kind"], "title": x["title"], "impact": x["impact"],
+               "certainty": cert.get(x["status"], "EXPECTED"), "source_url": x["source_url"], "direction": x["direction"],
+               "why": x["why"]} for x in pdat.get("roadmap", [])]
+        proj_rows = build_roadmap({t: {"verified": (project or {}).get("verified"), "data": {"events": ev}}}, None, [t])
+        g = {"HIGH": 0.2, "MEDIUM": 0.0, "LOW": -0.2}.get(pdat.get("growth_view"), 0.0)
+        news_long = float(np.clip(event_net(proj_rows, t, 365) + g, -1, 1))
+        data["horizons"] = horizon_outlook(c, data["snaps"], c.get("event_net", 0.0), news_long, data.get("checks"))
+        rows = [{k: r.get(k) for k in ("date", "scope", "title", "direction", "impact", "certainty", "why")}
+                for r in roadmap + proj_rows if t in r["coins"] or not r["coins"]]
+        report, errs = focus_ai(cfg.client, cfg.model, coin_brief(c, research.get(t)), deep_brief(data), rows, pdat)
+        errs = (project or {}).get("errors", []) + errs
+    ai = report.model_dump() if report else None
+    hviews = enforce_horizon_views(ai.get("horizon_views", []), data["horizons"]) if ai else {}
+    return {"focus": t, "data": data, "ai": ai, "errors": errs, "project": project, "project_rows": proj_rows,
+            "horizon_ai": hviews}
+
+
 # ───────────────────────── Full pipeline ─────────────────────────
 def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
                  bar: Callable[[float, str], None] | None = None) -> dict:
@@ -1005,8 +1104,8 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     progress("📡 Market Data Agent: ตรวจรายชื่อคู่เทรด…")
     valid = set(md.tickers().index)
     req = list(dict.fromkeys(cfg.watch))
-    watch_dropped = req[MAX_WATCH:]          # ใส่เกิน 3 เหรียญ → ใช้ 3 ตัวแรก ที่เหลือให้ Scanner ตัดสิน
-    req = req[:MAX_WATCH]
+    watch_dropped = req[cfg.max_watch:]      # ใส่เกินจำนวน → ใช้ตัวแรก ที่เหลือให้ Scanner ตัดสิน
+    req = req[:cfg.max_watch]
     watch = [w for w in req if f"{w}{QUOTE}" in valid]
     missing = [w for w in req if f"{w}{QUOTE}" not in valid]
     scan = {"picks": [], "tags": {}, "info": {}, "xs_bt": None, "universe": 0, "dropped_spread": 0, "ref_risk_adj": []}
@@ -1064,6 +1163,7 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
                                              focus=focus)
             news = {"items": items, "src": src, "report": report, "mode": nmode, "focus": focus}
             apply_news(coins, report, cfg.news_w)
+            cfg.news_items = items
         except Exception as e:  # noqa: BLE001
             news["error"] = str(e)[:200]
     d1s = {c["symbol"]: c["d1"] for c in coins}
@@ -1075,6 +1175,10 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     for c in analyzed:  # เทคนิครายตัว (หลังได้ Momentum เทียบตลาด) + โอกาสขึ้นตามกรอบเวลาที่เลือก
         c["tech"] = technical_votes(c)
         c["p_up_h"] = (c["fc"].get(H) or {}).get("p_up")
+        ck = score_check(c["d1"], min((7, 30, 90), key=lambda x: abs(x - H)))  # ทดสอบคะแนนย้อนหลังของเหรียญนี้
+        c["score_check"] = ck
+        if ck is not None and ck["ok"] and c["p_up_h"] is not None:
+            c["p_up_h"] = 0.5 * c["p_up_h"] + 0.5 * ck["p_today"]  # ปรับเทียบด้วยผลจริงในอดีต
 
     signals, watch_only = [], []
     for c in analyzed:
@@ -1088,7 +1192,9 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     research = {"by_ticker": {}, "log": []}
     macro_cal = None
     if cfg.client and cfg.ai_agents:
-        short = sorted(analyzed, key=lambda c: c["score"], reverse=True)[: cfg.n_research]
+        focus_c = [c for c in analyzed if watch and c["ticker"] == watch[0]]  # เหรียญที่เจาะลึกได้ Research เสมอ
+        short = focus_c + [c for c in sorted(analyzed, key=lambda c: c["score"], reverse=True) if c not in focus_c]
+        short = short[: max(cfg.n_research, len(focus_c))]
         research = research_agent(cfg.client, cfg.model_research, short, cfg.research_cache, progress,
                                   news["items"], na.headlines,
                                   lambda c: [f"{x['date']} {x['src']}: {x['title']}"
@@ -1117,11 +1223,21 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
         c["buy_ai"] = v.get("buy_score") if v else None
         c["buy_final"] = enforce_buy_score(c["buy_ai"], c["buy_sys"])
 
+    deep = None
+    fc_ = next((c for c in analyzed if watch and c["ticker"] == watch[0]), None)
+    if cfg.deep and fc_ is not None:
+        progress(f"🔬 Deep Dive {fc_['ticker']}: 1H-1W · Backtest 6 กลยุทธ์ · เทียบคู่แข่ง…")
+        try:
+            deep = run_deep(md, cfg, fc_, frames.get(fc_["symbol"], {}), research["by_ticker"], roadmap)
+        except Exception as e:  # noqa: BLE001 — Deep dive ล่มไม่ทำให้ผลหลักหาย
+            log.exception("deep dive")
+            deep = {"focus": fc_["ticker"], "data": None, "ai": None, "errors": [str(e)[:200]]}
+
     return {"coins": analyzed, "macro": macro, "glob": glob, "fng": fng, "corr": corr, "research": research,
             "port": port, "missing": missing, "skipped": skipped, "rss": rss, "news": news,
             "signals": signals, "watch_only": watch_only, "watch_dropped": watch_dropped,
             "scan": {k: scan[k] for k in ("xs_bt", "universe", "dropped_spread")},
-            "roadmap": roadmap, "macro_cal": macro_cal, "horizon": cfg.horizon,
+            "roadmap": roadmap, "macro_cal": macro_cal, "horizon": cfg.horizon, "deep": deep,
             "elapsed": time.perf_counter() - t0, "btc_d": btc_d, "ts": datetime.now(TZ_TH), "host": md.host}
 
 
