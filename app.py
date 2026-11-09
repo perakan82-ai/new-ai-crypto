@@ -503,6 +503,27 @@ def render_signals_only(dp: dict):
         st.info(f"🧠 {ai['signals_read']}")
 
 
+def ai_problem(res: dict) -> str | None:
+    """รวม error ของ AI ทุกส่วน → ข้อความเดียวที่ผู้ใช้เข้าใจ (None = AI ปกติ)"""
+    if not res.get("ai_on"):
+        return None
+    errs = list((res.get("port") or {}).get("errors") or [])
+    errs += list((res.get("deep") or {}).get("errors") or [])
+    errs += [e for b in (res.get("research") or {}).get("log", []) for e in (b.get("errors") or [])]
+    txt = " ".join(map(str, errs))
+    if not errs:
+        return None
+    if "API key" in txt or "PERMISSION_DENIED" in txt or "API_KEY_INVALID" in txt:
+        return "API Key ไม่ถูกต้องหรือไม่มีสิทธิ์ — สร้าง Key ใหม่ที่ Google AI Studio แล้วใส่ใน Secrets"
+    if "quota" in txt.lower() or "RESOURCE_EXHAUSTED" in txt or "429" in txt:
+        return "โควต้า Gemini หมดชั่วคราว — รอสักครู่แล้วกดวิเคราะห์ใหม่ หรือลดจำนวนเหรียญให้ AI Research"
+    if ("404" in txt or "NOT_FOUND" in txt) and (res.get("port") or {}).get("strategist") is None:
+        return "หาโมเดล Gemini ที่ใช้ได้ไม่เจอ — ลองเลือกโมเดลอื่นใน 🔧 ตั้งค่าขั้นสูง"
+    if (res.get("port") or {}).get("strategist") is None:
+        return "AI ตอบกลับไม่สำเร็จรอบนี้ — ลองกดวิเคราะห์ใหม่"
+    return None
+
+
 def render_home(res: dict, capital: float, risk_pct: float):
     """หน้าแรก: คำตอบเดียว ซื้อ / รอ / เลี่ยง + เหตุผล + ทิศทางแต่ละช่วงเวลา + แผน + ความแม่นที่ทดสอบแล้ว"""
     dp = res.get("deep") or {}
@@ -763,8 +784,8 @@ def main():
             n_med = st.slider("จำนวนเหรียญระยะกลางสูงสุด", 0, 6, 3)
             n_long = st.slider("จำนวนเหรียญระยะยาวสูงสุด", 0, 6, 3)
             msel = st.selectbox("🧠 โมเดล AI", GEMINI_MODELS + ["อื่นๆ (พิมพ์เอง)"], index=0)
-            model = st.text_input("ชื่อโมเดล", "gemini-2.5-flash") if msel.startswith("อื่น") else msel
-            model_research = st.selectbox("📰 โมเดล Research (ค้นเว็บ)", MODEL_FALLBACK, index=0)
+            model = st.text_input("ชื่อโมเดล", "gemini-flash-latest") if msel.startswith("อื่น") else msel
+            model_research = st.selectbox("📰 โมเดล Research (ค้นเว็บ)", GEMINI_MODELS, index=0)
             n_research = st.slider("จำนวนเหรียญให้ AI Research", 0, 12, 4)
             use_ai = st.toggle("เปิด AI Agents", value=bool(gkey))
             use_news = st.toggle("📰 เปิด News Agent", value=True)
@@ -831,6 +852,11 @@ def main():
         st.markdown("\n".join(f"- {n}" for n in macro["notes"]))
         st.caption(f"Data: {res['host']} · AI: {port['mode']} · ใช้เวลา {res['elapsed']:.1f}s · {res['ts']:%d/%m %H:%M}")
 
+    prob = ai_problem(res)
+    if prob:
+        st.error(f"⚠️ AI ใช้งานไม่ได้รอบนี้: {prob} · ตัวเลขที่คำนวณจากข้อมูลจริง (ราคา สถิติ เทคนิค) ยังใช้ได้ตามปกติ")
+    elif res.get("ai_on") and res.get("ai_models"):
+        st.caption("🧠 AI โมเดลที่ใช้ได้: " + ", ".join(res["ai_models"][:3]))
     focus = (res.get("deep") or {}).get("focus") or ""
     tabs = st.tabs([f"🎯 คำตอบ {focus}".strip(), f"🔬 เจาะลึก {focus}".strip(), "🔥 เหรียญจากตลาด", "💼 พอร์ตของฉัน",
                     "🗺 ข่าว & Roadmap", "💾 บันทึก & ข้อมูลละเอียด"])
