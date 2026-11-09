@@ -29,7 +29,8 @@ from analysis import cap_for
 from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
                     SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, __version__, fp, fpct, fprob)
 from market import MarketData
-from pipeline import (DIR_EMO, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
+from deep import check_table, horizon_table, mtf_table, peer_table, signals_table, strategy_table
+from pipeline import (DIR_EMO, final_verdict, outlook_label, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
                       evaluate_exports, forecast_md, full_report_md, holding_md, horizon_bucket, opportunity_rank,
                       roadmap_df, rule_verdict, run_pipeline, run_portfolio, size_long, size_medium, summary_text,
                       table_backtest, table_forecast, table_long, table_market_picks, table_medium, table_patterns,
@@ -338,6 +339,209 @@ def render_news_project(res: dict):
         st.caption(nw.get("error") or "News Agent ปิดอยู่ หรือยังไม่มีข่าว")
 
 
+def render_horizons(dp: dict, c: dict, show_signals: bool = True):
+    data, ai = dp["data"], dp.get("ai") or {}
+    hz, hai = data.get("horizons") or [], dp.get("horizon_ai") or {}
+    st.markdown(f"#### 🧭 ทิศทาง {dp['focus']} แต่ละช่วงเวลา (คะแนน /100)")
+    if go is not None and hz:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=[h["label"] for h in hz], y=[h["score"] for h in hz], name="คะแนนระบบ",
+                             marker_color=["#16a34a" if h["score"] >= 60 else "#dc2626" if h["score"] <= 40 else "#9ca3af"
+                                           for h in hz], text=[f"{h['score']:.0f}" for h in hz], textposition="outside"))
+        if hai:
+            fig.add_trace(go.Scatter(x=[h["label"] for h in hz], y=[(hai.get(h["label"]) or {}).get("score") for h in hz],
+                                     mode="markers+text", name="คะแนน AI", marker=dict(size=14, color="#38bdf8", symbol="diamond"),
+                                     text=[f"{(hai.get(h['label']) or {}).get('score', 0):.0f}" for h in hz],
+                                     textposition="top center"))
+        fig.add_hrect(y0=40, y1=60, fillcolor="#9ca3af", opacity=0.08, line_width=0)
+        fig.update_layout(height=320, yaxis=dict(range=[0, 105], title="คะแนน"), template="plotly_dark",
+                          margin=dict(l=8, r=8, t=20, b=8), legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(horizon_table(hz, hai), use_container_width=True, hide_index=True)
+    st.caption("คะแนน ≥60 + โอกาสขึ้น ≥55% = ขึ้น · ≤40 + ≤45% = ลง · ที่เหลือ = ไซด์เวย์/ไม่ชัด · "
+               "ความมั่นใจ 'สูง' = ตัวอย่างอิสระ ≥30 และ สถิติ/เทคนิค/ข่าว ชี้ทางเดียวกัน · "
+               "ช่วง 1 ปีมีตัวอย่างอิสระในอดีตน้อยมาก ความมั่นใจจึงต่ำเสมอ — ใช้ Roadmap โปรเจกต์ประกอบ")
+    if not show_signals:
+        return
+    st.markdown("#### 🔮 สัญญาณอินดิเคเตอร์ที่เพิ่งเกิด / กำลังจะเกิด")
+    sigs = data.get("signals") or []
+    if sigs:
+        st.dataframe(signals_table(sigs), use_container_width=True, hide_index=True)
+        st.caption("'กำลังจะเกิดใน ~N วัน' = ประมาณจากความเร็วที่เส้นเข้าใกล้กันในช่วง 5 แท่งล่าสุด ถ้าแนวโน้มเปลี่ยนก็อาจไม่เกิด")
+    if ai.get("signals_read"):
+        st.info(f"🧠 {ai['signals_read']}")
+
+
+def render_project(dp: dict):
+    pj = (dp.get("project") or {})
+    pd_ = pj.get("data")
+    if not pd_:
+        if pj.get("errors"):
+            st.caption("ค้นข้อมูลโปรเจกต์ไม่สำเร็จ: " + " | ".join(pj["errors"][:2]))
+        return
+    gv = {"HIGH": "🟢 สูง", "MEDIUM": "🟡 ปานกลาง", "LOW": "🔴 ต่ำ"}.get(pd_["growth_view"], pd_["growth_view"])
+    st.markdown(f"#### 🏗 โปรเจกต์ & Roadmap ปีนี้–ปีหน้า · ศักยภาพเติบโต 1-2 ปี: {gv}"
+                + ("" if pj.get("verified") else " ⚠️ ไม่ได้ค้นเว็บ"))
+    st.markdown(f"**{pd_['category']}** — {pd_['summary']}\n\n**เหตุผลศักยภาพเติบโต:** {pd_['growth_reason']}")
+    items = pd_.get("roadmap") or []
+    if items:
+        stt = {"DONE": "✅ เสร็จแล้ว", "IN_PROGRESS": "🔧 กำลังทำ", "PLANNED": "🗓 วางแผน", "RUMOR": "💬 ข่าวลือ"}
+        st.dataframe(pd.DataFrame([{"ช่วงเวลา": x["period"], "เหตุการณ์": x["title"], "ประเภท": x["kind"],
+                                    "สถานะ": stt.get(x["status"], x["status"]), "ผลที่คาด": DIR_EMO.get(x["direction"], "⚪ ±"),
+                                    "ผลกระทบ": x["impact"], "เหตุผล": x["why"],
+                                    "ที่มา": x["source_url"] if str(x["source_url"]).startswith("http") else "⚠️ ไม่มีลิงก์"}
+                                   for x in sorted(items, key=lambda x: x["period"])]),
+                     use_container_width=True, hide_index=True, column_config={"ที่มา": st.column_config.LinkColumn()})
+    a, b = st.columns(2)
+    a.markdown("**🚀 ปัจจัยที่จะทำให้โต**\n" + "\n".join(f"- {x}" for x in pd_["growth_drivers"]))
+    b.markdown("**⚠️ ความเสี่ยง**\n" + "\n".join(f"- {x}" for x in pd_["risks"]))
+    st.markdown(f"**Tokenomics / Unlock:** {pd_['tokenomics']}\n\n**การใช้งานจริง:** {pd_['adoption']}\n\n"
+                f"**คู่แข่ง:** {', '.join(pd_['competitors']) or '-'}")
+    if pj.get("sources"):
+        st.caption("แหล่งข้อมูล: " + " · ".join(f"[{x['title'][:40]}]({x['uri']})" for x in pj["sources"][:8]))
+
+
+def render_signals_only(dp: dict):
+    data, ai = dp["data"], dp.get("ai") or {}
+    sigs = data.get("signals") or []
+    st.markdown("#### 🔮 สัญญาณอินดิเคเตอร์ที่เพิ่งเกิด / กำลังจะเกิด")
+    if sigs:
+        st.dataframe(signals_table(sigs), use_container_width=True, hide_index=True)
+        st.caption("'กำลังจะเกิดใน ~N วัน' = ประมาณจากความเร็วที่เส้นเข้าใกล้กันใน 5 แท่งล่าสุด ถ้าแนวโน้มเปลี่ยนก็อาจไม่เกิด")
+    if ai.get("signals_read"):
+        st.info(f"🧠 {ai['signals_read']}")
+
+
+def render_home(res: dict, capital: float, risk_pct: float):
+    """หน้าแรก: คำตอบเดียว ซื้อ / รอ / เลี่ยง + เหตุผล + ทิศทางแต่ละช่วงเวลา + แผน + ความแม่นที่ทดสอบแล้ว"""
+    dp = res.get("deep") or {}
+    focus = dp.get("focus")
+    cb = {x["ticker"]: x for x in res["coins"]}
+    if not focus or focus not in cb:
+        st.info("ใส่ 1 เหรียญในช่อง 🔬 ที่ Sidebar แล้วกด 🚀 เริ่มวิเคราะห์")
+        return
+    c = cb[focus]
+    v = final_verdict(c, dp.get("data"))
+    box = {"green": st.success, "orange": st.warning, "red": st.error}[v["color"]]
+    box(f"### {v['action']} · {focus} {fp(c['price'])}\n{v['line']}")
+    k = st.columns(3)
+    ck = c.get("score_check") or {}
+    k[0].metric("คะแนนควรซื้อ", f"{v['score']:.0f}/100", "AI + ระบบ" if c.get("buy_ai") is not None else "ระบบ")
+    k[1].metric(f"โอกาสขึ้นใน {horizon_bucket(res.get('horizon', 30))} วัน", fprob(v["p_up"]),
+                "ปรับเทียบกับผลจริงแล้ว" if ck.get("ok") else "สถิติย้อนหลัง")
+    k[2].metric("มุมมอง", outlook_label(c))
+    ai = dp.get("ai") or {}
+    if ai.get("thesis"):
+        st.info(f"🧠 **AI สรุป:** {ai['thesis']}")
+    st.markdown("**ทำไม**\n" + "\n".join(f"- {r}" for r in v["reasons"]))
+    if not v["action"].startswith("⛔"):
+        sz = size_medium(c, capital, risk_pct, None)
+        st.markdown(f"**ขนาดไม้ที่แนะนำ:** {sz['qty']:.4g} {focus} ≈ ${sz['notional']:,.0f} · ถ้าโดน SL เสีย "
+                    f"${sz['loss']:,.0f} ({sz['loss_pct']:.2f}% ของทุน)")
+    if v["accuracy"]:
+        st.caption("🧪 " + v["accuracy"])
+    if dp.get("data"):
+        render_horizons(dp, c, show_signals=False)
+    st.markdown("#### 📋 แผนเข้า-ออก")
+    st.dataframe(trade_plan_table([c], res["ts"]), use_container_width=True, hide_index=True)
+    checks = list(((dp.get("data") or {}).get("checks") or {}).values())
+    if checks:
+        st.markdown("#### 🧪 คะแนนแบบนี้เคยแม่นแค่ไหนกับเหรียญนี้ (ทดสอบย้อนหลัง)")
+        st.dataframe(check_table(checks), use_container_width=True, hide_index=True)
+        st.caption("คำนวณคะแนนเทคนิคทุกวันในอดีต แล้วดูว่าหลังจากนั้นราคาขึ้นจริงไหม · ใช้เฉพาะข้อมูลที่รู้ ณ วันนั้น (walk-forward) · "
+                   "ทดสอบช่วง 30% ท้าย · Skill > 0 = ทายได้ดีกว่าการเดาด้วยค่าเฉลี่ย · ถ้าไม่ผ่าน ระบบลดน้ำหนักเทคนิคในคะแนนอัตโนมัติ")
+    st.caption("ดูรายละเอียดทั้งหมด (หลายกรอบเวลา, 6 กลยุทธ์, คู่แข่ง, โปรเจกต์, กราฟ) ได้ที่แท็บ 🔬 เจาะลึก")
+
+
+def render_details(res: dict, capital: float, risk_pct: float):
+    """ข้อมูลละเอียดสำหรับผู้ใช้ขั้นสูง (พับเก็บไว้)"""
+    coins, port, research = res["coins"], res["port"], res["research"]["by_ticker"]
+    pick_by = {(p["ticker"], p["horizon"]): p for p in port["picks"]}
+    final_win = {k: v["win_final"] for k, v in pick_by.items()}
+    with st.expander("🔮 คาดการณ์ราคา 7–180 วัน"):
+        render_prediction(res)
+    with st.expander("📐 รูปแบบกราฟ"):
+        tp = table_patterns(coins)
+        if len(tp):
+            st.dataframe(tp, use_container_width=True, hide_index=True)
+        else:
+            st.caption("ยังไม่พบรูปแบบกราฟเด่น")
+    with st.expander("⏱ ระยะกลาง / 🏦 ระยะยาว (DCA)"):
+        st.dataframe(table_medium(coins, research, final_win), use_container_width=True, hide_index=True)
+        st.dataframe(table_long(coins, research, final_win), use_container_width=True, hide_index=True)
+    with st.expander("⚠️ ความเสี่ยง & Backtest แผน"):
+        st.dataframe(pd.DataFrame([{
+            "เหรียญ": c["ticker"], "Regime": REG_TH[c["cf"]["regime"]], "Vol/ปี": f"{c['risk']['vol_ann'] * 100:.0f}%",
+            "Cap สูงสุด": f"{cap_for(c):.0f}%", "MDD 1Y": f"{c['risk']['mdd_1y'] * 100:.0f}%",
+            "Beta": f"{c['risk']['beta']:.2f}", "Corr BTC": f"{c['risk']['corr']:.2f}", "RS90 vs BTC": fpct(c["risk"]["rs90"]),
+        } for c in coins]), use_container_width=True, hide_index=True)
+        st.dataframe(table_backtest(coins), use_container_width=True, hide_index=True)
+    with st.expander("📄 สรุปข้อความ / รายงานเต็ม"):
+        st.code(summary_text(res, coins, port), language=None)
+        report = full_report_md(res, coins, research, port.get("views") or {}, pick_by, final_win, capital, risk_pct,
+                                _md_table)
+        st.download_button("⬇️ ดาวน์โหลดรายงานเต็ม (.md)", report, f"crypto_report_{res['ts']:%Y%m%d_%H%M}.md",
+                           "text/markdown")
+
+
+def render_deep(res: dict, capital: float, risk_pct: float):
+    dp = res.get("deep") or {}
+    data = dp.get("data")
+    if not data:
+        st.info("ใส่เหรียญ 1 เหรียญในช่อง 🔬 ที่ Sidebar แล้วกดเริ่มวิเคราะห์ เพื่อดูการวิเคราะห์เจาะลึก")
+        for e in dp.get("errors") or []:
+            st.caption(f"⚠️ {e}")
+        return
+    t = dp["focus"]
+    c = {x["ticker"]: x for x in res["coins"]}[t]
+    ai = dp.get("ai") or {}
+    pc = data["peers"]
+    k = st.columns(5)
+    k[0].metric(t, fp(c["price"]), fpct((c.get("mom") or {}).get("ret", {}).get(30)) + " 30D")
+    k[1].metric("คะแนนควรซื้อ", f"{c['buy_final']:.0f}/100", f"ระบบ {c['buy_sys']:.0f}")
+    k[2].metric("มุมมอง", outlook_label(c))
+    k[3].metric(f"โอกาสขึ้นใน {horizon_bucket(res.get('horizon', 30))} วัน", fprob(c.get("p_up_h")), "สถิติย้อนหลัง")
+    k[4].metric(f"อันดับในกลุ่ม {pc['sector']}", f"{pc['rank'] or '-'} / {pc['n']}")
+    if ai:
+        st.info(f"**🧠 สรุป:** {ai['thesis']}")
+        st.dataframe(pd.DataFrame([{"สถานการณ์": {"BULL": "🟢 Bull", "BASE": "⚪ Base", "BEAR": "🔴 Bear"}[x["name"]],
+                                    "เกิดเมื่อ": x["trigger"], "เป้า/กรอบราคา": x["target"], "ทำอะไร": x["action"]}
+                                   for x in ai["scenarios"]]), use_container_width=True, hide_index=True)
+        if ai.get("checklist"):
+            st.markdown("**✅ เช็กก่อนกดซื้อ**\n" + "\n".join(f"- {x}" for x in ai["checklist"]))
+    else:
+        st.caption("ใส่ Gemini API Key + เปิด AI Agents เพื่อให้ AI เขียนบทวิเคราะห์และสถานการณ์ Bull/Base/Bear")
+    render_signals_only(dp)
+    render_project(dp)
+    st.markdown("#### ⏱ หลายกรอบเวลา (กรอบใหญ่บอกทิศ · กรอบเล็กบอกจังหวะ)")
+    st.markdown(f"**{data['alignment']}**")
+    st.dataframe(mtf_table(data["snaps"]), use_container_width=True, hide_index=True)
+    if ai.get("timeframe_read"):
+        st.caption(f"🧠 {ai['timeframe_read']}")
+    st.markdown("#### 🧪 Backtest 6 กลยุทธ์บนเหรียญนี้")
+    st.markdown(data["lab"]["verdict"])
+    st.dataframe(strategy_table(data["lab"]), use_container_width=True, hide_index=True)
+    st.caption("ตัดสินที่ราคาปิด แล้วถือในแท่งถัดไป (ไม่มี look-ahead) · หักค่าธรรมเนียม 0.1% + slippage 0.05% ต่อฝั่ง · "
+               "Out-of-sample = 30% ท้ายของข้อมูล · 1H มีข้อมูลแค่ ~40 วัน ใช้ประกอบเท่านั้น · ผลในอดีตไม่รับประกันอนาคต")
+    if ai.get("best_strategy"):
+        st.caption(f"🧠 {ai['best_strategy']}")
+    st.markdown(f"#### 🥊 เทียบเหรียญกลุ่ม {pc['sector']} + BTC/ETH")
+    st.dataframe(peer_table(pc, t), use_container_width=True, hide_index=True)
+    if ai.get("vs_peers"):
+        st.caption(f"🧠 {ai['vs_peers']}")
+    rm = [r for r in res.get("roadmap") or [] if t in r["coins"] or not r["coins"]]
+    if rm:
+        st.markdown("#### 🗺 ข่าว/อีเวนต์ข้างหน้าที่กระทบเหรียญนี้")
+        st.dataframe(roadmap_df(rm), use_container_width=True, hide_index=True,
+                     column_config={"ที่มา": st.column_config.LinkColumn()})
+    if go is not None:
+        st.plotly_chart(chart(c), use_container_width=True)
+    views = (res.get("port") or {}).get("views") or {}
+    pick_by = {(p["ticker"], p["horizon"]): p for p in res["port"]["picks"]}
+    st.markdown(deep_dive_md(c, res["research"]["by_ticker"], views, pick_by, capital, risk_pct, res.get("news")),
+                unsafe_allow_html=True)
+
+
 def render_roadmap(res: dict):
     rm = res.get("roadmap") or []
     cal = res.get("macro_cal") or {}
@@ -438,35 +642,34 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ ตั้งค่า")
-        gkey = _secret("GEMINI_API_KEY") or st.text_input("Gemini API Key", type="password")
-        cgkey = _secret("COINGECKO_DEMO_KEY") or st.text_input("CoinGecko Demo Key (ไม่บังคับ)", type="password")
-        watch_raw = st.text_input(f"เหรียญที่สนใจ (สูงสุด {MAX_WATCH} เหรียญ คั่นด้วย ,)", DEFAULT_WATCH)
-        n_watch = len([w for w in watch_raw.split(",") if w.strip()])
-        if n_watch > MAX_WATCH:
-            st.warning(f"ใส่ {n_watch} เหรียญ → ใช้ {MAX_WATCH} ตัวแรก ที่เหลือให้ AI Scanner ตัดสินจากตลาด")
-        hz = st.selectbox("⏳ กรอบเวลาที่สนใจ", list(HORIZONS), index=2)
-        n_extra = st.slider("🤖 ให้ AI คัดเหรียญจากตลาดเพิ่ม", 0, 10, SCAN_DEFAULT_EXTRA)
-        min_qvol = st.number_input("Volume 24h ขั้นต่ำ (ล้าน USDT)", 5, 2000, 20, 5) * 1e6
-        st.divider()
-        capital = st.number_input("เงินทุน (USDT)", 100.0, 1e9, 10_000.0, 500.0)
-        risk_pct = st.slider("ความเสี่ยงต่อไม้ (% ทุน)", 0.25, 3.0, 1.0, 0.25)
-        n_med = st.slider("จำนวนเหรียญระยะกลางสูงสุด", 0, 6, 3)
-        n_long = st.slider("จำนวนเหรียญระยะยาวสูงสุด", 0, 6, 3)
-        st.divider()
-        msel = st.selectbox("🧠 โมเดล AI", GEMINI_MODELS + ["อื่นๆ (พิมพ์เอง)"], index=0)
-        model = st.text_input("ชื่อโมเดล", "gemini-2.5-flash") if msel.startswith("อื่น") else msel
-        model_research = st.selectbox("📰 โมเดล Research (ค้นเว็บ)", MODEL_FALLBACK, index=0)
-        n_research = st.slider("จำนวนเหรียญให้ AI Research โปรเจกต์", 0, 12, 6)
-        use_ai = st.toggle("เปิด AI Agents", value=bool(gkey))
-        use_news = st.toggle("📰 เปิด News Agent", value=True)
-        news_w = st.slider("น้ำหนักข่าวต่อคะแนน (±)", 0, 15, 8)
+        watch_raw = st.text_input("🔬 เหรียญที่ต้องการวิเคราะห์ (1 เหรียญ)", DEFAULT_WATCH,
+                                  help="เช่น SOL, ETH, HYPE · เหรียญอื่น AI จะคัดจากตลาดมาให้เปรียบเทียบ")
+        if len([w for w in watch_raw.split(",") if w.strip()]) > MAX_WATCH:
+            st.warning("ใส่ได้ 1 เหรียญ → ใช้ตัวแรก")
+        hz = st.selectbox("⏳ อยากถือประมาณ", list(HORIZONS), index=2)
+        capital = st.number_input("💰 เงินทุน (USDT)", 100.0, 1e9, 10_000.0, 500.0)
+        risk_pct = st.slider("🛡 ยอมเสียต่อไม้ (% ทุน)", 0.25, 3.0, 1.0, 0.25)
+        gkey = _secret("GEMINI_API_KEY") or st.text_input("🔑 Gemini API Key", type="password")
         run = st.button("🚀 เริ่มวิเคราะห์", type="primary", use_container_width=True)
-        if st.button("🗑 ล้าง cache", use_container_width=True):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            na.clear_cache()
-            for k in ("research_cache", "res", "port_res"):
-                st.session_state.pop(k, None)
+        with st.expander("🔧 ตั้งค่าขั้นสูง"):
+            cgkey = _secret("COINGECKO_DEMO_KEY") or st.text_input("CoinGecko Demo Key (ไม่บังคับ)", type="password")
+            n_extra = st.slider("🤖 ให้ AI คัดเหรียญจากตลาด", 0, 10, SCAN_DEFAULT_EXTRA)
+            min_qvol = st.number_input("Volume 24h ขั้นต่ำ (ล้าน USDT)", 5, 2000, 20, 5) * 1e6
+            n_med = st.slider("จำนวนเหรียญระยะกลางสูงสุด", 0, 6, 3)
+            n_long = st.slider("จำนวนเหรียญระยะยาวสูงสุด", 0, 6, 3)
+            msel = st.selectbox("🧠 โมเดล AI", GEMINI_MODELS + ["อื่นๆ (พิมพ์เอง)"], index=0)
+            model = st.text_input("ชื่อโมเดล", "gemini-2.5-flash") if msel.startswith("อื่น") else msel
+            model_research = st.selectbox("📰 โมเดล Research (ค้นเว็บ)", MODEL_FALLBACK, index=0)
+            n_research = st.slider("จำนวนเหรียญให้ AI Research", 0, 12, 4)
+            use_ai = st.toggle("เปิด AI Agents", value=bool(gkey))
+            use_news = st.toggle("📰 เปิด News Agent", value=True)
+            news_w = st.slider("น้ำหนักข่าวต่อคะแนน (±)", 0, 15, 8)
+            if st.button("🗑 ล้าง cache", use_container_width=True):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                na.clear_cache()
+                for k in ("research_cache", "res", "port_res"):
+                    st.session_state.pop(k, None)
 
     horizon = HORIZONS[hz]
     client = make_client(gkey) if use_ai else None
@@ -523,60 +726,28 @@ def main():
         st.markdown("\n".join(f"- {n}" for n in macro["notes"]))
         st.caption(f"Data: {res['host']} · AI: {port['mode']} · ใช้เวลา {res['elapsed']:.1f}s · {res['ts']:%d/%m %H:%M}")
 
-    tabs = st.tabs(["🔥 AI คัดเหรียญ", "🎯 จุดเข้า-ออก", "💼 พอร์ตของฉัน", "🔮 Price Prediction", "📐 รูปแบบกราฟ",
-                    "📰 ข่าว & โปรเจกต์", "⏱ ระยะกลาง", "🏦 ระยะยาว", "⚠️ Risk & Backtest", "📄 รายงาน",
-                    "🗺 Roadmap ข่าว", "💾 ดาวน์โหลด & ตรวจผล"])
+    focus = (res.get("deep") or {}).get("focus") or ""
+    tabs = st.tabs([f"🎯 คำตอบ {focus}".strip(), f"🔬 เจาะลึก {focus}".strip(), "🔥 เหรียญจากตลาด", "💼 พอร์ตของฉัน",
+                    "🗺 ข่าว & Roadmap", "💾 บันทึก & ข้อมูลละเอียด"])
     with tabs[0]:
-        render_picks(res, horizon, capital, risk_pct)
+        render_home(res, capital, risk_pct)
     with tabs[1]:
-        render_entries(res, capital, risk_pct)
+        render_deep(res, capital, risk_pct)
     with tabs[2]:
-        render_portfolio(res, client, model, cgkey, use_news)
+        render_picks(res, horizon, capital, risk_pct)
+        with st.expander("🎯 จุดเข้า-ออกของทุกเหรียญ + เหตุผลที่ยังไม่ผ่าน"):
+            render_entries(res, capital, risk_pct)
     with tabs[3]:
-        render_prediction(res)
+        render_portfolio(res, client, model, cgkey, use_news)
     with tabs[4]:
-        tp = table_patterns(coins)
-        if len(tp):
-            st.dataframe(tp, use_container_width=True, hide_index=True)
-        else:
-            st.info("ยังไม่พบรูปแบบกราฟเด่นในเหรียญที่วิเคราะห์")
-        st.caption("ตรวจจากแท่ง 1D ที่ปิดแล้ว · เป้า = measured move ตามตำรา · โอกาสแตะเป้าคำนวณจากสถิติจริงของเหรียญนั้น "
-                   "(รูปแบบกราฟไม่ได้รับประกันผล)")
-    with tabs[5]:
-        render_news_project(res)
-    with tabs[6]:
-        st.dataframe(table_medium(coins, research, final_win), use_container_width=True, hide_index=True)
-        st.caption("Win rate ระบบ = Backtest 40% + โอกาส TP1 ก่อน SL 40% + Conditional forward 20% · คุ้มทุนรวมค่าธรรมเนียม+slippage")
-    with tabs[7]:
-        st.dataframe(table_long(coins, research, final_win), use_container_width=True, hide_index=True)
-        st.caption("DCA 3 Tier จากแนวรับ/Fib/EMA 1W · ตัดขาดทุนเมื่อ Weekly ปิดต่ำกว่าระดับที่กำหนด")
-    with tabs[8]:
-        st.dataframe(pd.DataFrame([{
-            "เหรียญ": c["ticker"], "Regime": REG_TH[c["cf"]["regime"]], "Vol/ปี": f"{c['risk']['vol_ann'] * 100:.0f}%",
-            "Cap สูงสุด": f"{cap_for(c):.0f}%", "MDD 1Y": f"{c['risk']['mdd_1y'] * 100:.0f}%",
-            "Beta": f"{c['risk']['beta']:.2f}", "Corr BTC": f"{c['risk']['corr']:.2f}", "RS90 vs BTC": fpct(c["risk"]["rs90"]),
-            "Score": round(c["score"]),
-        } for c in coins]), use_container_width=True, hide_index=True)
-        st.markdown("#### 🧪 Backtest แผนระยะกลาง (เข้าแท่งถัดไป · ค่าธรรมเนียม 0.1% + slippage 0.05% ต่อฝั่ง)")
-        st.dataframe(table_backtest(coins), use_container_width=True, hide_index=True)
-        st.caption("Out-of-sample = 30% ท้ายของข้อมูล · In-sample ดีแต่ Out-of-sample ติดลบ = เสี่ยง Overfitting")
-        if len(res["corr"]) and go is not None:
-            cm = res["corr"]
-            fig = go.Figure(go.Heatmap(z=cm.values, x=cm.columns, y=cm.index, zmin=-1, zmax=1, colorscale="RdBu_r",
-                                       text=cm.values, texttemplate="%{text:.2f}"))
-            fig.update_layout(height=460, title="Correlation 90D", template="plotly_dark", margin=dict(l=8, r=8, t=40, b=8))
-            st.plotly_chart(fig, use_container_width=True)
-    with tabs[9]:
-        st.code(summary_text(res, coins, port), language=None)
-        st.caption("กดไอคอนคัดลอกมุมขวาบนเพื่อเก็บสรุปไว้ใช้")
-        report = full_report_md(res, coins, research, port.get("views") or {}, pick_by, final_win, capital, risk_pct,
-                                _md_table)
-        st.download_button("⬇️ ดาวน์โหลดรายงานเต็ม (.md)", report, f"crypto_report_{res['ts']:%Y%m%d_%H%M}.md",
-                           "text/markdown")
-    with tabs[10]:
         render_roadmap(res)
-    with tabs[11]:
+        with st.expander("📰 ข่าว 7 วัน & ข้อมูลโปรเจกต์รายเหรียญ"):
+            render_news_project(res)
+    with tabs[5]:
         render_export(res, horizon)
+        st.divider()
+        st.markdown("#### 🔧 ข้อมูลละเอียด")
+        render_details(res, capital, risk_pct)
 
     st.caption("⚠️ เพื่อการศึกษา ไม่ใช่คำแนะนำการลงทุน · ความน่าจะเป็นมาจากสถิติย้อนหลัง ไม่รับประกันอนาคต")
 
