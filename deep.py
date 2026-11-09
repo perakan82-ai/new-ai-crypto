@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from analysis import COST, donchian_trend, momentum_profile, regime_arr, setup_mask
+from analysis import COST, _fc_samples, donchian_trend, independent, laplace, momentum_profile, regime_arr, setup_mask
 from config import MAJORS, OOS_FRACTION, PEERS_MAX, SECTORS
 from market import add_indicators, closed_only
 
@@ -218,6 +218,280 @@ def peer_table(pc: dict, ticker: str) -> pd.DataFrame:
         "Corr กับเหรียญนี้": f"{r['corr']:.2f}"} for i, r in enumerate(pc["rows"])])
 
 
+# ════════════════════ 4) สัญญาณที่กำลังจะเกิด (v5.4) ════════════════════
+def _cross_eta(a: pd.Series, b: pd.Series, look: int = 5) -> tuple[float, float | None, bool]:
+    """ช่องห่าง (a-b)/b ตอนนี้ · จำนวนแท่งโดยประมาณจนตัดกันถ้าแนวโน้มช่องห่างเดิมต่อเนื่อง · เพิ่งตัดกันใน look แท่ง"""
+    g = ((a - b) / b.abs().replace(0, np.nan)).dropna()
+    if len(g) < look + 2:
+        return 0.0, None, False
+    now, prev = float(g.iloc[-1]), float(g.iloc[-1 - look])
+    rate = (now - prev) / look
+    eta = (-now / rate) if rate != 0 and now * rate < 0 else None
+    crossed = bool((np.sign(g.iloc[-look - 1:]).diff().fillna(0) != 0).any())
+    return now, eta, crossed
+
+
+def upcoming_signals(c: dict, frames: dict[str, pd.DataFrame]) -> list[dict]:
+    """สัญญาณอินดิเคเตอร์ที่ 'เพิ่งเกิด' หรือ 'กำลังจะเกิด' บน 1D และ 1W (ประมาณการเชิงเส้น ถ้าแนวโน้มปัจจุบันต่อเนื่อง)"""
+    out: list[dict] = []
+
+    def add(tf, sig, bias, when, trigger, detail):
+        out.append({"tf": tf, "signal": sig, "bias": bias, "when": when, "trigger": trigger, "detail": detail})
+
+    for tf, unit, mx in (("1d", "วัน", 20), ("1w", "สัปดาห์", 8)):
+        d = frames.get(tf)
+        if d is None or len(d) < 60:
+            continue
+        x = d.iloc[-1]
+        lab = TF_LABEL[tf]
+        for fast, slow, up_name, dn_name in (("ema20", "ema50", "EMA20 ตัดขึ้น EMA50", "EMA20 ตัดลง EMA50"),
+                                             ("ema50", "ema200", "Golden Cross (EMA50 ตัดขึ้น EMA200)",
+                                              "Death Cross (EMA50 ตัดลง EMA200)")):
+            if d[slow].isna().iloc[-1]:
+                continue
+            gap, eta, crossed = _cross_eta(d[fast], d[slow])
+            if crossed:
+                add(lab, up_name if gap > 0 else dn_name, 1 if gap > 0 else -1, "✅ เพิ่งเกิด", f"{x[slow]:.6g}",
+                    f"ห่าง {gap * 100:+.1f}%")
+            elif eta is not None and eta <= mx:
+                add(lab, dn_name if gap > 0 else up_name, -1 if gap > 0 else 1, f"⏳ ~{eta:.0f} {unit}",
+                    f"{x[slow]:.6g}", f"ช่องห่างแคบลง ตอนนี้ {gap * 100:+.1f}% (ถ้าแนวโน้มเดิมต่อเนื่อง)")
+        gap, eta, crossed = _cross_eta(d["macd"], d["macd_sig"])
+        if crossed:
+            add(lab, "MACD ตัดขึ้น Signal" if gap > 0 else "MACD ตัดลง Signal", 1 if x.macd > x.macd_sig else -1,
+                "✅ เพิ่งเกิด", "-", f"Histogram {x.macd_h:+.4g}")
+        elif eta is not None and eta <= mx / 2:
+            add(lab, "MACD กำลังจะตัดขึ้น" if x.macd < x.macd_sig else "MACD กำลังจะตัดลง",
+                1 if x.macd < x.macd_sig else -1, f"⏳ ~{eta:.0f} {unit}", "-", "Histogram เข้าใกล้ 0")
+        rsi, rsi5 = float(x.rsi), float(d["rsi"].iloc[-6])
+        if 60 <= rsi < 70 and rsi > rsi5:
+            add(lab, "RSI กำลังเข้าเขต Overbought (70)", 0, f"⏳ ใกล้ (RSI {rsi:.0f})", "-", "แรงซื้อแรง แต่เสี่ยงพักตัวเมื่อเกิน 70")
+        elif 30 < rsi <= 40 and rsi < rsi5:
+            add(lab, "RSI กำลังเข้าเขต Oversold (30)", 0, f"⏳ ใกล้ (RSI {rsi:.0f})", "-", "แรงขายแรง มักเด้งเมื่อต่ำกว่า 30")
+        elif rsi >= 70:
+            add(lab, "RSI Overbought", -1, f"✅ ตอนนี้ RSI {rsi:.0f}", "-", "ร้อนแรงเกิน ระวังย่อ")
+        elif rsi <= 30:
+            add(lab, "RSI Oversold", 1, f"✅ ตอนนี้ RSI {rsi:.0f}", "-", "ขายมากเกิน มีโอกาสเด้ง")
+        elif (rsi - 50) * (rsi5 - 50) < 0:
+            add(lab, "RSI ตัดเส้น 50 " + ("ขึ้น" if rsi > 50 else "ลง"), 1 if rsi > 50 else -1, "✅ เพิ่งเกิด", "-", f"RSI {rsi5:.0f} → {rsi:.0f}")
+        w = d["bb_width"].iloc[-120:].dropna()
+        if len(w) > 40 and (w.iloc[-1] <= w.quantile(0.15)):
+            add(lab, "Bollinger บีบตัว (Squeeze)", 0, "⏳ ใกล้เลือกทาง", f"ขึ้น > {x.bb_up:.6g} / ลง < {x.bb_lo:.6g}",
+                f"ความกว้างแคบที่สุด 15% ในรอบ {len(w)} แท่ง → มักตามด้วยการเคลื่อนไหวแรง")
+        hi20 = float(d["high"].iloc[-21:-1].max())
+        lo20 = float(d["low"].iloc[-21:-1].min())
+        if x.close > hi20:
+            add(lab, "Breakout 20 แท่ง", 1, "✅ เพิ่งเกิด", f"{hi20:.6g}", "ปิดเหนือ High 20 แท่ง (สัญญาณเข้า Donchian)")
+        elif hi20 / x.close - 1 <= 0.03:
+            add(lab, "ใกล้ Breakout 20 แท่ง", 1, "⏳ ห่าง " + f"{(hi20 / x.close - 1) * 100:.1f}%", f"{hi20:.6g}",
+                "ถ้าปิดเหนือระดับนี้ = เข้าเทรนด์ขาขึ้นระยะสั้น")
+        if x.close < lo20:
+            add(lab, "หลุด Low 20 แท่ง", -1, "✅ เพิ่งเกิด", f"{lo20:.6g}", "สัญญาณอ่อนแรง")
+        elif 1 - lo20 / x.close <= 0.03:
+            add(lab, "ใกล้หลุด Low 20 แท่ง", -1, f"⏳ ห่าง {(1 - lo20 / x.close) * 100:.1f}%", f"{lo20:.6g}",
+                "ถ้าปิดต่ำกว่า = แนวรับระยะสั้นแตก")
+        adx, adx5 = float(x.adx), float(d["adx"].iloc[-6])
+        if adx >= 20 and adx > adx5 + 3:
+            add(lab, "ADX เทรนด์กำลังแรงขึ้น", 1 if x.pdi > x.mdi else -1, f"✅ ADX {adx5:.0f} → {adx:.0f}", "-",
+                "+DI นำ (ขาขึ้น)" if x.pdi > x.mdi else "-DI นำ (ขาลง)")
+    price = c["price"]
+    above = sorted((L for L in c["levels"] if L["level"] > price * 1.003), key=lambda L: L["level"])[:1]
+    below = sorted((L for L in c["levels"] if L["level"] < price * 0.997), key=lambda L: -L["level"])[:1]
+    for L in above:
+        add("แนวสำคัญ", f"แนวต้านถัดไป ({L['src']})", 0, f"ห่าง {(L['level'] / price - 1) * 100:+.1f}%", f"{L['level']:.6g}",
+            f"ความแข็งแรง {L['strength']:.0f} · ทะลุได้ = เปิดทางขึ้นต่อ")
+    for L in below:
+        add("แนวสำคัญ", f"แนวรับถัดไป ({L['src']})", 0, f"ห่าง {(L['level'] / price - 1) * 100:+.1f}%", f"{L['level']:.6g}",
+            f"ความแข็งแรง {L['strength']:.0f} · หลุด = เสี่ยงลงต่อ")
+    for q in c.get("patterns", []):
+        add("รูปแบบกราฟ 1D", f"{q['name']} ({q['state']})", {"bull": 1, "bear": -1}.get(q["bias"], 0),
+            "✅ ยืนยันแล้ว" if not q["state"].startswith(("กำลัง", "บีบ")) else "⏳ รอยืนยัน",
+            f"{q['level']:.6g}", f"เป้าตามรูปแบบ {q['target']:.6g} · โอกาสแตะใน 60 วัน "
+            + (f"{q['p_target_60'] * 100:.0f}%" if q.get("p_target_60") is not None else "-"))
+    return out
+
+
+def signals_table(sigs: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{"กรอบ": s["tf"], "สัญญาณ": s["signal"],
+                          "ผล": "🟢 บวก" if s["bias"] > 0 else "🔴 ลบ" if s["bias"] < 0 else "⚪ จับตา",
+                          "เมื่อไหร่": s["when"], "ระดับราคา": s["trigger"], "รายละเอียด": s["detail"]} for s in sigs])
+
+
+# ════════════════════ 5) ทิศทางแต่ละช่วงเวลา (v5.4) ════════════════════
+HZ = (("1 วัน", 1, ("1h", "4h")), ("1 สัปดาห์", 7, ("4h", "1d")), ("1 เดือน", 30, ("1d",)),
+      ("3 เดือน", 90, ("1d", "1w")), ("1 ปี", 365, ("1w",)))
+
+
+def horizon_outlook(c: dict, snaps: list[dict], news_short: float, news_long: float,
+                    checks: dict[int, dict] | None = None) -> list[dict]:
+    """ทิศทาง + คะแนน 0-100 + กรอบราคา + ความมั่นใจ ของแต่ละช่วงเวลา
+
+    คะแนน = โอกาสขึ้นจากสถิติ 50% + เทคนิคของกรอบเวลาที่เกี่ยวข้อง 35% + ข่าว/โรดแมป 15%
+    ความมั่นใจ = จำนวนตัวอย่างอิสระ (n) + สถิติ/เทคนิค/ข่าวชี้ทางเดียวกันหรือไม่ — ไม่ใช่การรับประกัน
+    """
+    tech_by = {s["tf"]: 50 + 50 * s["net"] / max(len(s["votes"]), 1) for s in snaps}
+    out = []
+    for label, H, tfs in HZ:
+        S = _fc_samples(c, H)
+        p_up, n_eff, q = None, 0, None
+        if S is not None:
+            n_eff = S["n_eff"]
+            p_up = laplace(float((S["end"] > 0).mean()), n_eff)
+            q = np.quantile(S["end"], [0.25, 0.5, 0.75])
+        ts = [tech_by[t] for t in tfs if t in tech_by]
+        tech = float(np.mean(ts)) if ts else 50.0
+        news = news_short if H <= 30 else (0.5 * news_short + 0.5 * news_long if H <= 90 else news_long)
+        ck = (checks or {}).get(H)
+        w_tech = 0.35
+        if ck is not None:  # ปรับด้วยผลทดสอบย้อนหลังของเหรียญนี้
+            if ck["ok"]:
+                p_up = 0.5 * (p_up if p_up is not None else 0.5) + 0.5 * ck["p_today"]
+            else:
+                w_tech = 0.10  # เทคนิคไม่เคยทำนายเหรียญนี้ได้ → ลดน้ำหนัก
+        w_stat = 0.85 - w_tech
+        score = w_stat * (p_up * 100 if p_up is not None else 50) + w_tech * tech + 0.15 * (50 + 50 * news)
+        votes = [np.sign((p_up or 0.5) - 0.5), np.sign(tech - 50), np.sign(news)]
+        nz = [v for v in votes if v != 0]
+        agree = len(nz) >= 2 and (all(v > 0 for v in nz) or all(v < 0 for v in nz))  # สถิติ/เทคนิค/ข่าว ชี้ทางเดียวกัน
+        if score >= 60 and (p_up or 0) >= 0.55:
+            direction = "🟢 ขึ้น"
+        elif score <= 40 and (p_up or 1) <= 0.45:
+            direction = "🔴 ลง"
+        else:
+            direction = "⚪ ไซด์เวย์/ไม่ชัด"
+        conf = "สูง" if n_eff >= 30 and agree else ("กลาง" if n_eff >= 12 and agree else "ต่ำ")
+        out.append({"label": label, "H": H, "score": float(np.clip(score, 0, 100)), "p_up": p_up, "tech": tech,
+                    "tested": (ck["verdict"].split(" ")[0] if ck else "—"), "w_tech": w_tech,
+                    "news": news, "direction": direction, "confidence": conf, "n_eff": n_eff,
+                    "lo": c["price"] * (1 + q[0]) if q is not None else None,
+                    "mid": c["price"] * (1 + q[1]) if q is not None else None,
+                    "hi": c["price"] * (1 + q[2]) if q is not None else None})
+    return out
+
+
+def horizon_table(hz: list[dict], ai_views: dict | None = None) -> pd.DataFrame:
+    from config import fp  # noqa: PLC0415
+    rows = []
+    for h in hz:
+        v = (ai_views or {}).get(h["label"]) or {}
+        rows.append({"ช่วงเวลา": h["label"], "ทิศทาง": h["direction"], "คะแนน (ระบบ)": f"{h['score']:.0f}/100",
+                     "คะแนน (AI)": f"{v['score']:.0f}/100" if v else "-",
+                     "โอกาสขึ้น (สถิติ)": f"{h['p_up'] * 100:.0f}%" if h["p_up"] is not None else "-",
+                     "เทคนิค": f"{h['tech']:.0f}/100", "ทดสอบย้อนหลัง": h.get("tested", "—"),
+                     "ข่าว/โรดแมป": f"{h['news']:+.2f}",
+                     "กรอบราคา (50% กลาง)": f"{fp(h['lo'])} – {fp(h['hi'])}" if h["lo"] else "-",
+                     "ความมั่นใจ": f"{h['confidence']} (n={h['n_eff']})", "AI ให้เหตุผล": v.get("reason", "-")})
+    return pd.DataFrame(rows)
+
+
+# ════════════════════ 6) ทดสอบคะแนนย้อนหลัง + ปรับเทียบ (v6.0) ════════════════════
+def hist_tech_score(d: pd.DataFrame) -> pd.Series:
+    """คะแนนเทคนิค 0-100 ของทุกวันในอดีต (7 เทคนิคแบบเดียวกับที่ใช้วันนี้ · ใช้ข้อมูลถึงวันนั้นเท่านั้น)"""
+    c = d["close"]
+    e_long = d["ema200"].fillna(d["ema50"])
+    trend = np.where((c > e_long) & (d["ema20"] > d["ema50"]), 1, np.where((c < e_long) & (d["ema20"] < d["ema50"]), -1, 0))
+    rsi = d["rsi"]
+    mh, mh0 = d["macd_h"], d["macd_h"].shift()
+    adx = d["adx"].fillna(0)
+    dt = donchian_trend(d)
+    z = d["bb_z"]
+    obv_up = d["obv"] > d["obv"].shift(20)
+    votes = np.vstack([
+        trend,
+        np.where((rsi >= 52) & (rsi <= 72), 1, np.where((rsi < 42) | (rsi > 78), -1, 0)),
+        np.where((mh > 0) & (mh >= mh0), 1, np.where((mh < 0) & (mh <= mh0), -1, 0)),
+        np.where(adx >= 20, np.where(d["pdi"] > d["mdi"], 1, -1), 0),
+        np.where(dt >= 0.6, 1, np.where(dt <= 0.2, -1, 0)),
+        np.where(z > 2.2, -1, np.where((z < -1.5) & (trend >= 0), 1, 0)),
+        np.where(obv_up & (c > d["ema20"]), 1, np.where(~obv_up & (c < d["ema20"]), -1, 0)),
+    ])
+    sc = pd.Series(50 + 50 * votes.mean(axis=0), index=d.index)
+    sc.iloc[:60] = np.nan  # warm-up
+    return sc
+
+
+def _cal_p(score: np.ndarray, up: np.ndarray, known: np.ndarray, x: float, H: int, band: float = 10.0) -> tuple[float, int]:
+    """โอกาสขึ้นจากวันในอดีตที่คะแนนใกล้ x (±band) · ใช้เฉพาะวันที่รู้ผลแล้ว · ดึงเข้าหา 50% ตามจำนวนตัวอย่างอิสระ"""
+    m = known & np.isfinite(score) & (np.abs(score - x) <= band)
+    idx = np.where(m)[0]
+    if len(idx) == 0:
+        return 0.5, 0
+    n_ind = len(independent(idx, H))
+    return laplace(float(up[idx].mean()), n_ind), n_ind
+
+
+def score_check(d: pd.DataFrame, H: int, start: int = 250) -> dict | None:
+    """Backtest คะแนนเทคนิคของเหรียญนี้ที่กรอบเวลา H วัน (walk-forward ไม่มี look-ahead)
+
+    - ทุกวัน t: โอกาสขึ้นที่ปรับเทียบแล้ว = อัตราขึ้นจริงของวันก่อนหน้าที่คะแนนใกล้กัน และ 'รู้ผลแล้ว' ณ วัน t (j + H ≤ t)
+    - วัดผลช่วง 30% ท้าย (out-of-sample): Brier skill เทียบการเดาด้วยอัตราขึ้นเฉลี่ยในอดีต · ความแม่นของทิศทาง
+    - วันนี้: โอกาสขึ้นของวันในอดีตที่คะแนนใกล้วันนี้
+    """
+    c = d["close"].to_numpy(float)
+    n = len(c)
+    if n < start + H + 60:
+        return None
+    sc = hist_tech_score(d).to_numpy()
+    fwd = np.full(n, np.nan)
+    fwd[: n - H] = c[H:] / c[: n - H] - 1
+    up = fwd > 0
+    preds, base, actual, ts = [], [], [], []
+    for t in range(start, n - H):
+        if not np.isfinite(sc[t]):
+            continue
+        known = np.zeros(n, bool)
+        known[: t - H + 1] = True  # วัน j รู้ผล ณ วัน t ก็ต่อเมื่อ j + H ≤ t
+        known &= np.isfinite(fwd)
+        p, _ = _cal_p(sc, up, known, sc[t], H)
+        preds.append(p)
+        base.append(float(up[known].mean()) if known.any() else 0.5)
+        actual.append(float(up[t]))
+        ts.append(t)
+    if len(preds) < 60:
+        return None
+    preds, base, actual = np.array(preds), np.array(base), np.array(actual)
+    k = int(len(preds) * 0.7)
+    bs = float(np.mean((preds[k:] - actual[k:]) ** 2))
+    bb = float(np.mean((base[k:] - actual[k:]) ** 2))
+    skill = 1 - bs / bb if bb > 0 else 0.0
+    sure = np.abs(preds[k:] - 0.5) >= 0.05
+    hit = float(((preds[k:][sure] > 0.5) == (actual[k:][sure] > 0.5)).mean()) if sure.any() else None
+    known_all = np.isfinite(fwd)
+    p_today, n_today = _cal_p(sc, up, known_all, sc[-1], H) if np.isfinite(sc[-1]) else (0.5, 0)
+    hi = known_all & (sc >= 60)
+    lo = known_all & (sc <= 40)
+    spread = float(fwd[hi].mean() - fwd[lo].mean()) if hi.sum() >= 20 and lo.sum() >= 20 else None
+    buckets = []
+    for a, b, lab in ((-1, 40, "≤40 (ลบ)"), (40, 60, "40-60 (กลาง)"), (60, 101, "≥60 (บวก)")):
+        m = known_all & (sc > a) & (sc <= b) if a >= 0 else known_all & (sc <= b)
+        if m.sum():
+            buckets.append({"label": lab, "n": int(m.sum()), "n_ind": len(independent(np.where(m)[0], H)),
+                            "up": float(up[m].mean()), "ret": float(np.median(fwd[m]))})
+    if skill > 0.02 and (spread or 0) > 0:
+        verdict, ok = "✅ คะแนนเทคนิคทำนายเหรียญนี้ได้ดีกว่าการเดา", True
+    elif skill > -0.02:
+        verdict, ok = "🟡 คะแนนเทคนิคทำนายได้อ่อน ใช้ประกอบเท่านั้น", False
+    else:
+        verdict, ok = "🔴 คะแนนเทคนิคไม่มีพลังทำนายเหรียญนี้ → ระบบลดน้ำหนักเทคนิค", False
+    return {"H": H, "skill": skill, "hit": hit, "n_test": int(len(preds) - k), "p_today": p_today, "n_today": n_today,
+            "score_today": float(sc[-1]) if np.isfinite(sc[-1]) else None, "spread": spread, "buckets": buckets,
+            "verdict": verdict, "ok": ok}
+
+
+def check_table(checks: list[dict]) -> pd.DataFrame:
+    rows = []
+    for ck in checks:
+        bk = {b["label"]: b for b in ck["buckets"]}
+        row = {"กรอบเวลา": f"{ck['H']} วัน", "ผลทดสอบ": ck["verdict"],
+               "ทายทิศถูก (ช่วงทดสอบ)": f"{ck['hit'] * 100:.0f}%" if ck["hit"] is not None else "-",
+               "Skill vs เดา": f"{ck['skill'] * 100:+.1f}%", "วันทดสอบ": ck["n_test"]}
+        for lab in ("≥60 (บวก)", "40-60 (กลาง)", "≤40 (ลบ)"):
+            b = bk.get(lab)
+            row[f"คะแนน {lab}: ขึ้นจริง"] = f"{b['up'] * 100:.0f}% (n≈{b['n_ind']})" if b else "-"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # ════════════════════ รวม ════════════════════
 def deep_analysis(c: dict, raw: dict[str, pd.DataFrame], peer_d1: dict[str, pd.DataFrame]) -> dict:
     """raw = แท่งเทียนดิบของเหรียญนี้ {tf: df} · peer_d1 = 1D (ปิดแล้ว + indicators) ของเหรียญคู่แข่ง"""
@@ -228,7 +502,11 @@ def deep_analysis(c: dict, raw: dict[str, pd.DataFrame], peer_d1: dict[str, pd.D
     snaps = [tf_snapshot(frames[tf], tf) for tf in ("1h", "4h", "1d", "1w") if tf in frames and len(frames[tf]) > 30]
     lab = strategy_lab(c["d1"], frames.get("1h"))
     pc = peer_compare(c["ticker"], c["d1"], peer_d1)
-    return {"ticker": c["ticker"], "snaps": snaps, "alignment": mtf_alignment(snaps), "lab": lab, "peers": pc}
+    sigs = upcoming_signals(c, frames)
+    checks = {H: ck for H in (7, 30, 90) if (ck := score_check(c["d1"], H)) is not None}
+    return {"ticker": c["ticker"], "snaps": snaps, "alignment": mtf_alignment(snaps), "lab": lab, "peers": pc,
+            "signals": sigs, "checks": checks,
+            "horizons": horizon_outlook(c, snaps, c.get("event_net", 0.0), 0.0, checks)}
 
 
 def deep_brief(deep: dict) -> dict:
@@ -243,6 +521,15 @@ def deep_brief(deep: dict) -> dict:
                         "mdd": round(r["mdd"], 3), "oos_sharpe": r["oos_sharpe"] and round(r["oos_sharpe"], 2),
                         "trades": r["trades"], "in_position_now": r["now"]} for r in lab["rows"]],
         "best_strategy": lab["best"]["name"] if lab["best"] else None, "strategy_verdict": lab["verdict"],
+        "horizons": [{"horizon": h["label"], "system_score": round(h["score"]), "direction": h["direction"],
+                      "p_up": h["p_up"] and round(h["p_up"], 2), "tech": round(h["tech"]), "confidence": h["confidence"],
+                      "n": h["n_eff"], "range_p25_p75": [h["lo"] and round(h["lo"], 6), h["hi"] and round(h["hi"], 6)]}
+                     for h in deep.get("horizons", [])],
+        "score_backtest": {f"{H}d": {"verdict": ck["verdict"], "skill": round(ck["skill"], 3), "hit": ck["hit"],
+                                     "p_up_calibrated": round(ck["p_today"], 2), "n_similar": ck["n_today"]}
+                           for H, ck in deep.get("checks", {}).items()},
+        "upcoming_signals": [f"[{x['tf']}] {x['signal']} · {x['when']} · ระดับ {x['trigger']} · "
+                             f"{'+' if x['bias'] > 0 else '-' if x['bias'] < 0 else '0'}" for x in deep.get("signals", [])],
         "peers": {"sector": deep["peers"]["sector"], "rank": deep["peers"]["rank"], "of": deep["peers"]["n"],
                   "table": [{"t": r["t"], "ret30": r["ret30"] and round(r["ret30"], 3), "risk_adj": round(r["risk_adj"], 2)}
                             for r in deep["peers"]["rows"]]},
