@@ -94,9 +94,13 @@ class MarketData:
         """24h ticker ของคู่ USDT ทั้งหมด"""
         df = pd.DataFrame(self._get("ticker/24hr", {}))
         df = df[df["symbol"].str.endswith(QUOTE)].copy()
-        for c in ("lastPrice", "priceChangePercent", "quoteVolume", "count"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in ("lastPrice", "priceChangePercent", "quoteVolume", "count", "bidPrice", "askPrice"):
+            if c in df:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
         df["base"] = df["symbol"].str[: -len(QUOTE)]
+        if "bidPrice" in df and "askPrice" in df:  # spread = ต้นทุนแฝงตอนเข้า/ออก
+            mid = (df["bidPrice"] + df["askPrice"]) / 2
+            df["spread"] = ((df["askPrice"] - df["bidPrice"]) / mid.replace(0, np.nan)).clip(lower=0)
         return df.set_index("symbol")
 
 
@@ -187,6 +191,18 @@ def _bb(d: pd.DataFrame) -> None:
     sd = d["close"].rolling(20).std()
     d["bb_mid"], d["bb_up"], d["bb_lo"] = m, m + 2 * sd, m - 2 * sd
     d["bb_width"] = (d["bb_up"] - d["bb_lo"]) / m
+    d["bb_z"] = (d["close"] - m) / sd.replace(0, np.nan)  # Z-score: ห่างจากค่าเฉลี่ยกี่ SD (mean reversion)
+
+
+@indicator("orderflow")
+def _orderflow(d: pd.DataFrame) -> None:
+    """สัดส่วนแรงซื้อ (taker buy / volume) 7 แท่ง เทียบ 30 แท่ง
+    Order flow ช่วยอธิบายพลวัตราคา (Easley et al. 2024; Barucci & Marazzina 2023) — ใช้เป็นตัวยืนยัน ไม่ใช่สัญญาณเดี่ยว"""
+    if "taker_q" not in d:
+        return
+    q = d["qvol"].replace(0, np.nan)
+    d["taker_ratio7"] = d["taker_q"].rolling(7).sum() / q.rolling(7).sum()
+    d["taker_ratio30"] = d["taker_q"].rolling(30).sum() / q.rolling(30).sum()
 
 
 @indicator("vwap")
