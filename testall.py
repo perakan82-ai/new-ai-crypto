@@ -658,3 +658,57 @@ def test_plotly_charts_have_unique_keys():
     assert calls and all(keys), "ทุก st.plotly_chart ต้องมี key"
     names = [k.group(1) for k in keys]
     assert len(names) == len(set(names))
+
+
+# ───────────── v6.1: แผนเมื่อยังไม่แนะนำซื้อ + ข้อมูลพื้นฐาน ─────────────
+def test_downside_plan(fake_md):
+    from pipeline import RunConfig, downside_plan, final_verdict, run_pipeline
+    res = run_pipeline(FakeMarketWide(), RunConfig(watch=["SOL"], n_extra=0, use_news=False))
+    c = [x for x in res["coins"] if x["ticker"] == "SOL"][0]
+    dn = downside_plan(c, 30)
+    assert dn["dip30"] <= dn["dip50"] < c["price"]
+    assert dn["buy_zone"][0] < dn["buy_zone"][1] < c["price"] * 1.01
+    assert all(x["level"] < c["price"] for x in dn["supports"]) and dn["flip"]
+    v = final_verdict(c, res["deep"]["data"])
+    assert v["recommend"] == v["action"].startswith("✅")
+
+
+def test_project_schema_backers_optional():
+    from ai import ProjectDeep
+    old = {"summary": "s", "category": "c", "roadmap": [], "tokenomics": "", "adoption": "", "competitors": [],
+           "growth_drivers": [], "risks": [], "growth_view": "LOW", "growth_reason": ""}
+    assert ProjectDeep.model_validate(old).backers == []  # cache เก่าที่ไม่มีนายทุนยังใช้ได้
+    new = ProjectDeep.model_validate({**old, "backers": [{"name": "a16z", "kind": "VC", "detail": "Seed 2018",
+                                                           "source_url": "https://x"}]})
+    assert new.backers[0].kind == "VC"
+
+
+# ───────────── v6.2: อ่านสถานการณ์ (เฟส · แรงซื้อขาย · จะจบเมื่อไหร่) ─────────────
+def test_market_read_all_coins():
+    from pipeline import RunConfig, run_pipeline
+    res = run_pipeline(FakeMarketWide(), RunConfig(watch=["SOL"], n_extra=4, use_news=False))
+    ranks = sorted(res["coins"], key=lambda c: -c["buy_final"])
+    for c in res["coins"]:
+        rd = c["read"]
+        assert rd["phase"] and rd["story"] and all(e["sign"] in (-1, 1) for e in rd["evidence"])
+        if rd["timing"]:
+            t = rd["timing"]
+            assert 1 <= t["p25"] <= t["p50"] <= t["p75"] <= 60
+        if not rd["verdict"]["recommend"]:
+            assert "ยังไม่แนะนำ" in rd["story"] and rd["flip"]
+    top = ranks[0]["read"]
+    if not top["verdict"]["recommend"]:
+        assert top["story"].startswith("อันดับ 1 ในตาราง แต่")
+
+
+def test_phase_downtrend_and_selling_pressure():
+    from pipeline import market_phase, pressure_evidence
+    path = np.r_[np.linspace(100, 160, 200), np.linspace(160, 80, 200)]  # ขึ้นแล้วลงแรง
+    d = _shape(path, vol=np.r_[np.full(390, 1e6), np.full(10, 4e6)])
+    d["taker_q"] = d["qvol"] * 0.45
+    d = indicators.add_indicators(d)
+    c = {"d1": d, "cf": {"regime": "DOWN"}, "mom": {"trend": 0.0, "orderflow": -0.05}}
+    ev = pressure_evidence(c)
+    assert any(e["sign"] < 0 for e in ev)
+    phase, _ = market_phase(c, ev)
+    assert "ขาลง" in phase or "Capitulation" in phase
