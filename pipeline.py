@@ -17,8 +17,13 @@ from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, m
                 strategist_and_risk)
 from config import (FEE, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
                     STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
-from analysis import _fc_samples, technical_votes
-from ai import coin_brief, enforce_horizon_views, focus_ai, project_deep_agent
+from analysis import _fc_samples, regime_arr, technical_votes
+from ai import _DISCOVERED as _ai_found, coin_brief, enforce_horizon_views, focus_ai, project_deep_agent
+
+
+def _ai_models() -> list[str]:
+    return _ai_found[:4]
+
 from deep import deep_analysis, deep_brief, horizon_outlook, peers_for, score_check
 from analysis import (BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent,
                       momentum_profile, touch_prob, xs_momentum_backtest, xs_rank)
@@ -978,7 +983,15 @@ def final_verdict(c: dict, deep: dict | None = None) -> dict:
     sig = next((x for x in (deep or {}).get("signals", []) if x["bias"] != 0), None)
     if sig:
         reasons.append(f"🔮 {sig['signal']} · {sig['when']}" + (f" · ระดับ {sig['trigger']}" if sig["trigger"] != "-" else ""))
+    best = (((deep or {}).get("lab") or {}).get("best"))
+    if best:
+        reasons.append(f"🧪 กลยุทธ์ที่ได้ผลดีที่สุดกับเหรียญนี้ในอดีต: {best['name']} → ตอนนี้ "
+                       + ("🟢 อยู่ในสถานะถือ" if best["now"] else "⚪ อยู่ในสถานะถือเงินสด"))
     ck = c.get("score_check")
+    mu = (ck or {}).get("macro_up")
+    if mu:
+        reasons.append(f"🌐 ในอดีตช่วงที่ BTC เป็น{ {'UP': 'ขาขึ้น', 'TRANS': 'ช่วงเปลี่ยนผ่าน', 'DOWN': 'ขาลง'}.get(mu['state'], mu['state'])} "
+                       f"เหรียญนี้ขึ้นจริงใน {ck['H']} วัน {mu['up'] * 100:.0f}% ของครั้ง (n≈{mu['n_ind']})")
     acc = None
     if ck:
         acc = (f"{ck['verdict']} · ทดสอบ {ck['n_test']} วันล่าสุด ทายทิศถูก "
@@ -1325,10 +1338,13 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
 
     H = horizon_bucket(cfg.horizon)
+    btc_reg = pd.Series(regime_arr(btc_d), index=btc_d.index)  # สภาพ BTC รายวัน ใช้ปรับเทียบตามภาวะตลาด
+    for c in analyzed:
+        c["macro_arr"] = btc_reg.reindex(c["d1"].index).ffill().fillna("TRANS").to_numpy()
     for c in analyzed:  # เทคนิครายตัว (หลังได้ Momentum เทียบตลาด) + โอกาสขึ้นตามกรอบเวลาที่เลือก
         c["tech"] = technical_votes(c)
         c["p_up_h"] = (c["fc"].get(H) or {}).get("p_up")
-        ck = score_check(c["d1"], min((7, 30, 90), key=lambda x: abs(x - H)))  # ทดสอบคะแนนย้อนหลังของเหรียญนี้
+        ck = score_check(c["d1"], min((7, 30, 90), key=lambda x: abs(x - H)), macro=c["macro_arr"])  # ทดสอบย้อนหลัง
         c["score_check"] = ck
         if ck is not None and ck["ok"] and c["p_up_h"] is not None:
             c["p_up_h"] = 0.5 * c["p_up_h"] + 0.5 * ck["p_today"]  # ปรับเทียบด้วยผลจริงในอดีต
@@ -1395,6 +1411,7 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
             "signals": signals, "watch_only": watch_only, "watch_dropped": watch_dropped,
             "scan": {k: scan[k] for k in ("xs_bt", "universe", "dropped_spread")},
             "roadmap": roadmap, "macro_cal": macro_cal, "horizon": cfg.horizon, "deep": deep,
+            "ai_on": bool(cfg.client and cfg.ai_agents), "ai_models": list(_ai_models()),
             "elapsed": time.perf_counter() - t0, "btc_d": btc_d, "ts": datetime.now(TZ_TH), "host": md.host}
 
 
