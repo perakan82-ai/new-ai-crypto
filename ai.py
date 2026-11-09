@@ -293,6 +293,38 @@ class Scenario(BaseModel):
     action: str         # ควรทำอะไร
 
 
+class HorizonView(BaseModel):
+    horizon: Literal["1 วัน", "1 สัปดาห์", "1 เดือน", "3 เดือน", "1 ปี"]
+    direction: Literal["UP", "DOWN", "SIDEWAYS"]
+    score: int                  # 0-100 (ระบบจำกัดให้ห่างคะแนนระบบ ≤ ±10)
+    reason: str
+
+
+class RoadmapItem(BaseModel):
+    period: str                 # YYYY-MM-DD / YYYY-MM / YYYY-Qn / YYYY
+    title: str
+    kind: Literal["UPGRADE", "LAUNCH", "MAINNET", "UNLOCK", "ETF", "PARTNERSHIP", "REGULATION", "GOVERNANCE",
+                  "BURN", "LISTING", "OTHER"]
+    status: Literal["DONE", "IN_PROGRESS", "PLANNED", "RUMOR"]
+    direction: Literal["POSITIVE", "NEGATIVE", "MIXED"]
+    impact: Literal["HIGH", "MEDIUM", "LOW"]
+    why: str
+    source_url: str
+
+
+class ProjectDeep(BaseModel):
+    summary: str                # โปรเจกต์ทำอะไร แก้ปัญหาอะไร
+    category: str
+    roadmap: list[RoadmapItem]  # ปีนี้ + ปีหน้า
+    tokenomics: str             # supply, inflation, unlock schedule
+    adoption: str               # ตัวชี้วัดการใช้งานจริง (TVL, ผู้ใช้, รายได้) ที่ค้นเจอ
+    competitors: list[str]
+    growth_drivers: list[str]
+    risks: list[str]
+    growth_view: Literal["HIGH", "MEDIUM", "LOW"]   # ศักยภาพเติบโต 1-2 ปี (เชิงคุณภาพ)
+    growth_reason: str
+
+
 class FocusReport(BaseModel):
     thesis: str                 # ข้อสรุปหลัก 2-3 ประโยค
     timeframe_read: str         # อ่านหลายกรอบเวลาอย่างไร
@@ -300,14 +332,64 @@ class FocusReport(BaseModel):
     vs_peers: str               # เทียบกับเหรียญกลุ่มเดียวกัน
     scenarios: list[Scenario]
     checklist: list[str]        # สิ่งที่ต้องเช็กก่อนกดซื้อ
+    horizon_views: list[HorizonView] = []
+    signals_read: str = ""      # สัญญาณที่กำลังจะเกิดหมายความว่าอะไร
 
 
-def focus_ai(client, model: str, brief: dict, deep_b: dict, roadmap_rows: list[dict]) -> tuple[FocusReport | None, list[str]]:
+PROJECT_TTL = 12 * 3600
+
+
+def project_deep_agent(client, model: str, c: dict, cache: dict, headlines: list[str] | None = None) -> dict | None:
+    """ค้นข้อมูลโปรเจกต์เจาะลึกของเหรียญเดียว (Google Search) · Roadmap ปีนี้ + ปีหน้า · cache 12 ชม."""
+    key = ("project_deep", model, c["ticker"])
+    hit = cache.get(key)
+    if hit and time.time() - hit["ts"] < PROJECT_TTL:
+        return hit
+    now = datetime.now(TZ_TH)
+    y = now.year
+    f = c.get("fund") or {}
+    prompt = f"""วันนี้ {now:%Y-%m-%d}. คุณคือ Crypto Project Research Analyst ใช้ Google Search ค้นข้อมูลล่าสุดของ
+{f.get('name') or c['ticker']} ({c['ticker']}) · หมวด {f.get('categories')} · Rank #{f.get('rank')}
+ค้นจาก: เว็บไซต์/บล็อกทางการ, เอกสาร roadmap/whitepaper, GitHub/forum governance, Token unlock trackers, ข่าวจากสื่อคริปโตหลัก
+หัวข่าวล่าสุดที่ระบบเก็บได้: {json.dumps((headlines or [])[:8], ensure_ascii=False)}
+ให้:
+- summary: โปรเจกต์ทำอะไร แก้ปัญหาอะไร (2-3 ประโยค), category
+- roadmap: เหตุการณ์/เป้าหมายของปี {y} และ {y + 1} (5-12 รายการ) ทั้งที่เสร็จแล้วล่าสุดและที่วางแผนไว้:
+  period (YYYY-MM-DD / YYYY-MM / YYYY-Qn / YYYY), title, kind, status, direction (ผลต่อราคา +/−/±), impact, why, source_url (ลิงก์จริง)
+  รวม token unlock ก้อนใหญ่ด้วย (direction NEGATIVE)
+- tokenomics: supply หมุนเวียน/สูงสุด, เงินเฟ้อ, ตาราง unlock
+- adoption: ตัวเลขการใช้งานจริงที่ค้นเจอ (TVL, ผู้ใช้, ธุรกรรม, รายได้) พร้อมช่วงเวลา
+- competitors: คู่แข่งหลัก 2-5 ตัว · growth_drivers: ปัจจัยที่จะทำให้โต 3-5 ข้อ · risks: ความเสี่ยง 3-5 ข้อ
+- growth_view: HIGH/MEDIUM/LOW ศักยภาพเติบโต 1-2 ปีเทียบคู่แข่ง + growth_reason
+กฎ: ใช้ข้อมูลที่ค้นเจอจริงเท่านั้น ห้ามแต่งวันที่/ตัวเลข ห้ามใส่ราคาเป้าหมาย ไม่พบให้เว้นว่าง ภาษาไทย (ชื่อเฉพาะอังกฤษได้)"""
+    out, srcs, mode, errs = gemini_json(client, model, prompt, ProjectDeep, search=True)
+    if not out:
+        return {"ts": time.time(), "data": None, "sources": [], "mode": mode, "verified": False, "errors": errs}
+    res = {"ts": time.time(), "data": out.model_dump(), "sources": srcs, "mode": mode, "verified": "search" in mode,
+           "errors": errs}
+    cache[key] = res
+    return res
+
+
+def enforce_horizon_views(views: list[dict], system: list[dict], band: float = 10.0) -> dict[str, dict]:
+    """คะแนน AI รายช่วงเวลา ถูกจำกัดให้อยู่ใน ±band ของคะแนนระบบ"""
+    sys_by = {h["label"]: h["score"] for h in system}
+    out = {}
+    for v in views:
+        if v["horizon"] in sys_by:
+            sc = float(np.clip(v["score"], sys_by[v["horizon"]] - band, sys_by[v["horizon"]] + band))
+            out[v["horizon"]] = {**v, "score": float(np.clip(sc, 0, 100))}
+    return out
+
+
+def focus_ai(client, model: str, brief: dict, deep_b: dict, roadmap_rows: list[dict],
+             project: dict | None = None) -> tuple[FocusReport | None, list[str]]:
     """AI วิเคราะห์เจาะลึก 1 เหรียญ จากตัวเลขที่ระบบคำนวณแล้ว (ห้ามคิดราคาใหม่)"""
     prompt = f"""คุณคือ Senior Crypto Analyst วิเคราะห์เจาะลึกเหรียญ {brief['ticker']} สำหรับนักลงทุน Spot (ไม่ใช้ leverage)
 ข้อมูลรายเหรียญ (ระบบคำนวณแล้ว): {json.dumps(brief, ensure_ascii=False, default=str)}
 หลายกรอบเวลา + Backtest 6 กลยุทธ์ + เทียบคู่แข่ง: {json.dumps(deep_b, ensure_ascii=False, default=str)}
 ข่าว/อีเวนต์ข้างหน้า: {json.dumps(roadmap_rows[:12], ensure_ascii=False, default=str)}
+โปรเจกต์ & Roadmap (ค้นเว็บ): {json.dumps(project or {}, ensure_ascii=False, default=str)[:6000]}
 
 เขียน:
 - thesis: ข้อสรุปหลัก 2-3 ประโยค (ซื้อ/รอ/เลี่ยง + เพราะอะไร)
@@ -317,6 +399,10 @@ def focus_ai(client, model: str, brief: dict, deep_b: dict, roadmap_rows: list[d
 - scenarios: BULL / BASE / BEAR อย่างละ 1 · trigger และ target ต้องใช้ราคาที่อยู่ในข้อมูล (buy_zone, sl, tp1, tp2, forecast, dca, stop_weekly) เท่านั้น
   ห้ามใส่ความน่าจะเป็นที่ไม่มีในข้อมูล
 - checklist: 3-5 ข้อที่ต้องเช็กก่อนกดซื้อ
+- horizon_views: ครบ 5 ช่วง (1 วัน, 1 สัปดาห์, 1 เดือน, 3 เดือน, 1 ปี) direction + score 0-100 + reason 1 ประโยค
+  เริ่มจาก horizons.system_score แล้วปรับได้ไม่เกิน ±10 (ระบบจะตัดส่วนเกิน) · ช่วงสั้นอิงเทคนิค/สัญญาณที่กำลังจะเกิด
+  ช่วงยาว (3 เดือน, 1 ปี) อิง roadmap โปรเจกต์ tokenomics/unlock และแนวโน้มรายสัปดาห์ · ถ้า confidence ต่ำให้บอกในเหตุผล
+- signals_read: อธิบาย upcoming_signals ที่สำคัญที่สุด 2-3 ตัวว่าถ้าเกิดจริงหมายความว่าอะไร และระดับราคาที่ต้องดู
 ภาษาไทย กระชับ ห้ามรับประกันผล"""
     out, _, _, errs = gemini_json(client, model, prompt, FocusReport, search=False)
     return out, errs
@@ -372,6 +458,7 @@ def coin_brief(c: dict, research: dict | None) -> dict:
                        for t in (c.get("tech") or {}).get("votes", [])],
         "tech_agreement_0_100": _r((c.get("tech") or {}).get("score"), 0),
         "buy_score_system": _r(c.get("buy_sys"), 0),
+        "score_backtest": {k: (c.get("score_check") or {}).get(k) for k in ("verdict", "skill", "hit", "p_today", "n_today")},
         "p_up_horizon": _r(c.get("p_up_h")),
         "upcoming_news_net": _r(c.get("event_net")),
         "research": {"verified": (research or {}).get("verified"), "catalyst_score": rd.get("catalyst_score"),
