@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "5.2.0"
+__version__ = "6.0.0"
 
 import functools
 import numpy as np
@@ -18,8 +18,8 @@ from urllib3.util.retry import Retry
 # data-api.binance.vision มาก่อน: ใช้ได้จาก Server สหรัฐฯ (Streamlit Cloud / GitHub Actions) ที่ api.binance.com บล็อก (HTTP 451)
 BINANCE_HOSTS = ("https://data-api.binance.vision/api/v3", "https://api.binance.com/api/v3")
 QUOTE = "USDT"
-TF_LIMIT = {"4h": 500, "1d": 1000, "1w": 1000}
-TF_TTL = {"4h": 600, "1d": 600, "1w": 1800}  # เก็บแท่งเทียนใช้ซ้ำ (วินาที)
+TF_LIMIT = {"1h": 1000, "4h": 500, "1d": 1000, "1w": 1000}
+TF_TTL = {"1h": 300, "4h": 600, "1d": 600, "1w": 1800}  # เก็บแท่งเทียนใช้ซ้ำ (วินาที)
 WORKERS = 8
 MIN_BARS_1D = 62
 
@@ -52,8 +52,21 @@ XS_TOP = 5                 # ถือ 5 อันดับแรก
 # → ใช้ "ย่อในเทรนด์ขาขึ้น": 1D ขาขึ้น + 4H ต่ำกว่าเส้นกลาง Bollinger ≤ -1.5 SD เป็นจังหวะเข้า
 MR_Z_4H = -1.5
 
+# ───────────── Focus coin (เจาะลึก) ─────────────
+PEERS_MAX = 6              # เทียบกับเหรียญกลุ่มเดียวกันสูงสุด 6 ตัว (+ BTC/ETH เป็นเกณฑ์)
+SECTORS = {
+    "Layer 1": ["ETH", "SOL", "ADA", "AVAX", "NEAR", "SUI", "APT", "TON", "DOT", "ATOM", "ICP", "SEI", "BNB", "TRX",
+                "ALGO", "HBAR", "KAS", "INJ", "TIA", "S"],
+    "Payments": ["BTC", "XRP", "XLM", "LTC", "BCH", "ETC"],
+    "DeFi": ["UNI", "AAVE", "ENA", "PENDLE", "LDO", "CRV", "JUP", "RAY", "HYPE", "ONDO", "JTO", "LINK"],
+    "AI": ["FET", "TAO", "RENDER", "WLD", "VIRTUAL", "GRT"],
+    "Meme": ["DOGE", "PEPE", "SHIB", "BONK", "WIF", "TRUMP", "PUMP"],
+    "Layer 2": ["ARB", "OP", "POL", "IMX"],
+    "Privacy": ["ZEC", "XMR"],
+}
+
 # ───────────── Watchlist + Scanner ─────────────
-MAX_WATCH = 3              # ผู้ใช้ใส่เหรียญที่สนใจได้สูงสุด 3 เหรียญ ที่เหลือให้ระบบคัดจากตลาด
+MAX_WATCH = 1              # v5.3: วิเคราะห์เจาะลึก 1 เหรียญ · ที่เหลือให้ AI Scanner คัดจากตลาดไว้เปรียบเทียบ
 SCAN_TOP = 80              # สแกนจาก Volume สูงสุด 80 อันดับ
 SCAN_DEFAULT_EXTRA = 7
 MAX_SPREAD = 0.002         # bid-ask spread ≤ 0.2% (Fil & Kristoufek 2020: ต้นทุนการเทรดกินกำไรมาก)
@@ -66,7 +79,7 @@ STATUS_TXT = {"🟢": "ซื้อได้", "🟡": "รอย่อ/Confirm"
 REG_TH = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่าน", "DOWN": "ขาลง"}
 STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "PYUSD", "XUSD", "RLUSD",
            "BFUSD", "USDS", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "PAXG", "WBTC", "WBETH", "BNSOL"}
-DEFAULT_WATCH = "BTC, ETH, SOL"
+DEFAULT_WATCH = "SOL"
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 MODEL_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
