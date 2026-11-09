@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-FREQ = {"4h": "4h", "1d": "1D", "1w": "7D"}
+FREQ = {"1h": "1h", "4h": "4h", "1d": "1D", "1w": "7D"}
 
 
 def synth_ohlcv(n: int = 800, tf: str = "1d", seed: int = 1, drift: float = 0.0008, vol: float = 0.03,
@@ -41,8 +41,8 @@ class FakeMarket:
                              "base": [s[:-4] for s in self.symbols]}, index=list(self.symbols))
 
     def ohlcv(self, symbol, tf, limit=None):
-        seed = sum(map(ord, symbol)) + {"4h": 1, "1d": 2, "1w": 3}[tf]
-        n = {"4h": 500, "1d": 900, "1w": 160}[tf]
+        seed = sum(map(ord, symbol)) + {"1h": 4, "4h": 1, "1d": 2, "1w": 3}[tf]
+        n = {"1h": 1000, "4h": 500, "1d": 900, "1w": 160}[tf]
         return synth_ohlcv(n, tf, seed=seed)
 
 
@@ -205,7 +205,7 @@ def test_quality_gate_and_signal(coin):
 # ───────────── Pipeline (end-to-end, no network) ─────────────
 def test_pipeline_end_to_end(fake_md):
     from pipeline import RunConfig, run_pipeline
-    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL", "XYZ"], n_extra=0, use_news=False))
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL", "XYZ"], n_extra=0, use_news=False, max_watch=3))
     assert {c["ticker"] for c in res["coins"]} == {"ETH", "SOL"}
     assert res["missing"] == ["XYZ"]
     assert res["port"]["mode"].startswith("rule-based")
@@ -369,7 +369,7 @@ def test_pattern_points_bounded():
 
 def test_opportunity_rank(fake_md):
     from pipeline import RunConfig, opportunity_rank, run_pipeline, table_patterns
-    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False))
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False, max_watch=3))
     for h in (7, 30, 180):
         df = opportunity_rank(res["coins"], h)
         assert len(df) == 2 and df["คะแนนโอกาส"].is_monotonic_decreasing
@@ -452,7 +452,7 @@ def test_scan_universe_filters_and_ranks():
 def test_watchlist_capped_to_three():
     from pipeline import RunConfig, run_pipeline, table_market_picks
     md = FakeMarketWide()
-    res = run_pipeline(md, RunConfig(watch=["ETH", "SOL", "XRP", "ADA", "NEAR"], n_extra=4, use_news=False))
+    res = run_pipeline(md, RunConfig(watch=["ETH", "SOL", "XRP", "ADA", "NEAR"], n_extra=4, use_news=False, max_watch=3))
     base = {c["ticker"] for c in res["coins"] if not c["is_pick"]}
     picks = {c["ticker"] for c in res["coins"] if c["is_pick"]}
     assert base == {"ETH", "SOL", "XRP"} and res["watch_dropped"] == ["ADA", "NEAR"]
@@ -503,7 +503,7 @@ def test_buy_score_bounds():
 def test_decision_plan_export_and_evaluate(fake_md):
     from pipeline import (RunConfig, analysis_export_df, decision_table, evaluate_exports, run_pipeline,
                           trade_plan_table)
-    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False, horizon=30))
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False, horizon=30, max_watch=3))
     for c in res["coins"]:
         assert 0 <= c["buy_sys"] <= 100 and c["buy_final"] == c["buy_sys"] and c["buy_ai"] is None
         assert c["p_up_h"] is None or 0 <= c["p_up_h"] <= 1
@@ -522,3 +522,128 @@ def test_decision_plan_export_and_evaluate(fake_md):
     out = evaluate_exports(ex, fake_md, now=pd.Timestamp("2026-11-07", tz="UTC"))
     assert set(out["table"]["outcome"]) <= {"✅ WIN", "❌ LOSS", "✅ WIN (time stop)", "❌ LOSS (time stop)"}
     assert out["summary"]["closed"] == 2 and out["summary"]["n_h"] == 2
+
+
+# ───────────── v5.3: Deep dive 1 เหรียญ ─────────────
+def test_default_single_focus_and_deep():
+    from deep import mtf_table, peer_table, strategy_table
+    from pipeline import RunConfig, run_pipeline
+    md = FakeMarketWide()
+    res = run_pipeline(md, RunConfig(watch=["SOL", "ETH"], n_extra=3, use_news=False))
+    base = [c["ticker"] for c in res["coins"] if not c["is_pick"]]
+    assert base == ["SOL"] and res["watch_dropped"] == ["ETH"]
+    dp = res["deep"]
+    assert dp["focus"] == "SOL" and dp["data"] is not None, dp.get("errors")
+    d = dp["data"]
+    assert [s["tf"] for s in d["snaps"]] == ["1h", "4h", "1d", "1w"]
+    names = [(r["tf"], r["name"]) for r in d["lab"]["rows"]]
+    assert sum(tf == "1d" for tf, _ in names) == 6 and sum(tf == "1h" for tf, _ in names) == 3
+    assert d["peers"]["sector"] == "Layer 1" and d["peers"]["rank"] is not None
+    assert len(mtf_table(d["snaps"])) == 4 and len(strategy_table(d["lab"])) == 9 and len(peer_table(d["peers"], "SOL"))
+    from pipeline import analysis_export_df
+    ex = analysis_export_df(res, 30)
+    assert ex.loc[ex["ticker"] == "SOL", "is_focus"].item() is True
+
+
+def test_pos_backtest_no_lookahead_and_costs(daily):
+    from deep import pos_backtest, strategy_positions
+    d = indicators.add_indicators(daily)
+    bh = pos_backtest(d, np.ones(len(d)), 365)
+    c = d["close"].to_numpy()
+    r = c[1:] / c[:-1] - 1
+    expected = (1 + r[0] - 0.0015) * np.prod(1 + r[1:]) - 1  # เข้าครั้งเดียวที่แท่งแรก เสียต้นทุนฝั่งเดียว
+    assert bh["ret"] == pytest.approx(expected, rel=1e-6)
+    pos = strategy_positions(d)["MA20/50 Crossover"]
+    full = pos_backtest(d, pos, 365)
+    k = 600
+    part = pos_backtest(d.iloc[:k], pos[:k], 365)
+    cut = pos_backtest(d, np.r_[pos[:k], np.zeros(len(d) - k)], 365)
+    assert part["trades"] <= cut["trades"] <= full["trades"] + 1
+    for r in (full, part):
+        assert -1 <= r["mdd"] <= 0 and 0 <= r["exposure"] <= 1
+
+
+# ───────────── v5.4: ทิศทางรายช่วงเวลา / สัญญาณที่กำลังจะเกิด / โปรเจกต์ ─────────────
+def test_horizons_and_signals():
+    from deep import horizon_table, signals_table
+    from pipeline import RunConfig, analysis_export_df, run_pipeline
+    res = run_pipeline(FakeMarketWide(), RunConfig(watch=["SOL"], n_extra=0, use_news=False))
+    d = res["deep"]["data"]
+    hz = d["horizons"]
+    assert [h["label"] for h in hz] == ["1 วัน", "1 สัปดาห์", "1 เดือน", "3 เดือน", "1 ปี"]
+    for h in hz:
+        assert 0 <= h["score"] <= 100 and h["confidence"] in ("สูง", "กลาง", "ต่ำ")
+        assert h["p_up"] is None or 0 <= h["p_up"] <= 1
+        if h["lo"] is not None:
+            assert h["lo"] <= h["mid"] <= h["hi"]
+    assert hz[-1]["confidence"] == "ต่ำ"  # 1 ปี ตัวอย่างอิสระน้อยเสมอ
+    assert len(horizon_table(hz)) == 5
+    for x in d["signals"]:
+        assert x["bias"] in (-1, 0, 1) and x["signal"]
+    signals_table(d["signals"])
+    ex = analysis_export_df(res, 30)
+    assert "hz_365d_score" in ex.columns
+
+
+def test_cross_eta():
+    from deep import _cross_eta
+    i = pd.RangeIndex(30)
+    a = pd.Series(np.linspace(90, 99, 30), index=i)   # เส้นเร็ววิ่งเข้าหาเส้นช้า
+    b = pd.Series(np.full(30, 100.0), index=i)
+    gap, eta, crossed = _cross_eta(a, b)
+    assert gap < 0 and eta is not None and 0 < eta < 5 and not crossed
+
+
+def test_horizon_view_enforced_and_year_parse():
+    from ai import enforce_horizon_views
+    from pipeline import parse_event_date
+    sys_ = [{"label": "1 ปี", "score": 50.0}]
+    v = enforce_horizon_views([{"horizon": "1 ปี", "direction": "UP", "score": 95, "reason": "x"}], sys_)
+    assert v["1 ปี"]["score"] == 60
+    assert parse_event_date("2027") == (pd.Timestamp("2027-07-01"), True)
+
+
+# ───────────── v6.0: ทดสอบคะแนนย้อนหลัง + คำตอบเดียว ─────────────
+def test_hist_score_no_lookahead(daily):
+    from deep import hist_tech_score
+    d = indicators.add_indicators(daily)
+    full = hist_tech_score(d)
+    k = 500
+    part = hist_tech_score(indicators.add_indicators(daily.iloc[: k + 1]))
+    assert np.allclose(full.iloc[60: k + 1].to_numpy(), part.iloc[60:].to_numpy(), equal_nan=True)
+    assert full.dropna().between(0, 100).all()
+
+
+def test_score_check_random_walk_has_no_skill(daily):
+    from deep import check_table, score_check
+    d = indicators.add_indicators(daily)
+    for H in (7, 30):
+        ck = score_check(d, H)
+        assert ck is not None and not ck["ok"]  # ข้อมูลสุ่ม → ต้องไม่อ้างว่าทำนายได้
+        assert 0 <= ck["p_today"] <= 1 and ck["n_test"] > 50
+    check_table([score_check(d, 7)])
+
+
+def test_score_check_detects_real_edge():
+    from deep import score_check
+    # ตลาดจำลองที่ "เทรนด์ต่อเนื่องจริง" (autocorrelation บวก) → คะแนนเทคนิคควรมีพลังทำนาย
+    rng = np.random.default_rng(11)
+    n, r = 1200, np.zeros(1200)
+    for i in range(1, n):
+        r[i] = 0.25 * r[i - 1] + rng.normal(0, 0.02) + 0.004 * np.sign(np.sin(i / 60))
+    close = 100 * np.exp(np.cumsum(r))
+    idx = pd.date_range(end="2026-11-06", periods=n, freq="1D", tz="UTC")
+    o = np.r_[close[0], close[:-1]]
+    df = pd.DataFrame({"open": o, "high": np.maximum(o, close) * 1.01, "low": np.minimum(o, close) * 0.99,
+                       "close": close, "qvol": 1e6, "volume": 1e6 / close, "taker_q": 5e5}, index=idx)
+    ck = score_check(indicators.add_indicators(df), 7)
+    assert ck["skill"] > 0 and ck["spread"] > 0
+
+
+def test_final_verdict_and_home(fake_md):
+    from pipeline import RunConfig, final_verdict, run_pipeline
+    res = run_pipeline(FakeMarketWide(), RunConfig(watch=["SOL"], n_extra=0, use_news=False))
+    c = [x for x in res["coins"] if x["ticker"] == "SOL"][0]
+    v = final_verdict(c, res["deep"]["data"])
+    assert v["action"][:1] in ("✅", "⏳", "⛔") and v["reasons"] and 0 <= v["score"] <= 100
+    assert c["score_check"] is not None
