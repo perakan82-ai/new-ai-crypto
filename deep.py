@@ -254,7 +254,8 @@ def upcoming_signals(c: dict, frames: dict[str, pd.DataFrame]) -> list[dict]:
                 add(lab, up_name if gap > 0 else dn_name, 1 if gap > 0 else -1, "✅ เพิ่งเกิด", f"{x[slow]:.6g}",
                     f"ห่าง {gap * 100:+.1f}%")
             elif eta is not None and eta <= mx:
-                add(lab, dn_name if gap > 0 else up_name, -1 if gap > 0 else 1, f"⏳ ~{eta:.0f} {unit}",
+                add(lab, dn_name if gap > 0 else up_name, -1 if gap > 0 else 1,
+                    "⏳ ภายใน 1–2 " + unit if eta < 1.5 else f"⏳ ~{eta:.0f} {unit}",
                     f"{x[slow]:.6g}", f"ช่องห่างแคบลง ตอนนี้ {gap * 100:+.1f}% (ถ้าแนวโน้มเดิมต่อเนื่อง)")
         gap, eta, crossed = _cross_eta(d["macd"], d["macd_sig"])
         if crossed:
@@ -420,18 +421,28 @@ def _cal_p(score: np.ndarray, up: np.ndarray, known: np.ndarray, x: float, H: in
     return laplace(float(up[idx].mean()), n_ind), n_ind
 
 
-def score_check(d: pd.DataFrame, H: int, start: int = 250) -> dict | None:
+def score_check(d: pd.DataFrame, H: int, start: int = 250, macro: np.ndarray | None = None) -> dict | None:
     """Backtest คะแนนเทคนิคของเหรียญนี้ที่กรอบเวลา H วัน (walk-forward ไม่มี look-ahead)
 
     - ทุกวัน t: โอกาสขึ้นที่ปรับเทียบแล้ว = อัตราขึ้นจริงของวันก่อนหน้าที่คะแนนใกล้กัน และ 'รู้ผลแล้ว' ณ วัน t (j + H ≤ t)
     - วัดผลช่วง 30% ท้าย (out-of-sample): Brier skill เทียบการเดาด้วยอัตราขึ้นเฉลี่ยในอดีต · ความแม่นของทิศทาง
     - วันนี้: โอกาสขึ้นของวันในอดีตที่คะแนนใกล้วันนี้
+    - macro (สภาพ BTC รายวัน UP/TRANS/DOWN): ถ้ามี จะเทียบเฉพาะวันที่ BTC อยู่ในสภาพเดียวกัน (ตัวอย่างไม่พอ → ไม่กรอง)
     """
     c = d["close"].to_numpy(float)
     n = len(c)
     if n < start + H + 60:
         return None
     sc = hist_tech_score(d).to_numpy()
+    mac = np.asarray(macro, dtype=object) if macro is not None and len(macro) == n else None
+
+    def cal(known: np.ndarray, t: int) -> tuple[float, int, bool]:
+        if mac is not None:
+            p, k = _cal_p(sc, up, known & (mac == mac[t]), sc[t], H)
+            if k >= 8:
+                return p, k, True
+        p, k = _cal_p(sc, up, known, sc[t], H)
+        return p, k, False
     fwd = np.full(n, np.nan)
     fwd[: n - H] = c[H:] / c[: n - H] - 1
     up = fwd > 0
@@ -442,7 +453,7 @@ def score_check(d: pd.DataFrame, H: int, start: int = 250) -> dict | None:
         known = np.zeros(n, bool)
         known[: t - H + 1] = True  # วัน j รู้ผล ณ วัน t ก็ต่อเมื่อ j + H ≤ t
         known &= np.isfinite(fwd)
-        p, _ = _cal_p(sc, up, known, sc[t], H)
+        p, _, _ = cal(known, t)
         preds.append(p)
         base.append(float(up[known].mean()) if known.any() else 0.5)
         actual.append(float(up[t]))
@@ -457,7 +468,12 @@ def score_check(d: pd.DataFrame, H: int, start: int = 250) -> dict | None:
     sure = np.abs(preds[k:] - 0.5) >= 0.05
     hit = float(((preds[k:][sure] > 0.5) == (actual[k:][sure] > 0.5)).mean()) if sure.any() else None
     known_all = np.isfinite(fwd)
-    p_today, n_today = _cal_p(sc, up, known_all, sc[-1], H) if np.isfinite(sc[-1]) else (0.5, 0)
+    p_today, n_today, macro_used = cal(known_all, n - 1) if np.isfinite(sc[-1]) else (0.5, 0, False)
+    macro_up = None
+    if mac is not None:
+        mm = known_all & (mac == mac[-1])
+        if mm.sum() >= 30:
+            macro_up = {"state": str(mac[-1]), "up": float(up[mm].mean()), "n_ind": len(independent(np.where(mm)[0], H))}
     hi = known_all & (sc >= 60)
     lo = known_all & (sc <= 40)
     spread = float(fwd[hi].mean() - fwd[lo].mean()) if hi.sum() >= 20 and lo.sum() >= 20 else None
@@ -475,14 +491,20 @@ def score_check(d: pd.DataFrame, H: int, start: int = 250) -> dict | None:
         verdict, ok = "🔴 คะแนนเทคนิคไม่มีพลังทำนายเหรียญนี้ → ระบบลดน้ำหนักเทคนิค", False
     return {"H": H, "skill": skill, "hit": hit, "n_test": int(len(preds) - k), "p_today": p_today, "n_today": n_today,
             "score_today": float(sc[-1]) if np.isfinite(sc[-1]) else None, "spread": spread, "buckets": buckets,
-            "verdict": verdict, "ok": ok}
+            "verdict": verdict, "ok": ok, "macro_used": macro_used, "macro_up": macro_up}
+
+
+REG_NAME = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่าน", "DOWN": "ขาลง"}
 
 
 def check_table(checks: list[dict]) -> pd.DataFrame:
     rows = []
     for ck in checks:
         bk = {b["label"]: b for b in ck["buckets"]}
+        mu = ck.get("macro_up")
         row = {"กรอบเวลา": f"{ck['H']} วัน", "ผลทดสอบ": ck["verdict"],
+               "เมื่อ BTC สภาพเดียวกับวันนี้": (f"BTC {REG_NAME.get(mu['state'], mu['state'])}: ขึ้นจริง {mu['up'] * 100:.0f}% "
+                                              f"(n≈{mu['n_ind']})" if mu else "-"),
                "ทายทิศถูก (ช่วงทดสอบ)": f"{ck['hit'] * 100:.0f}%" if ck["hit"] is not None else "-",
                "Skill vs เดา": f"{ck['skill'] * 100:+.1f}%", "วันทดสอบ": ck["n_test"]}
         for lab in ("≥60 (บวก)", "40-60 (กลาง)", "≤40 (ลบ)"):
@@ -503,7 +525,7 @@ def deep_analysis(c: dict, raw: dict[str, pd.DataFrame], peer_d1: dict[str, pd.D
     lab = strategy_lab(c["d1"], frames.get("1h"))
     pc = peer_compare(c["ticker"], c["d1"], peer_d1)
     sigs = upcoming_signals(c, frames)
-    checks = {H: ck for H in (7, 30, 90) if (ck := score_check(c["d1"], H)) is not None}
+    checks = {H: ck for H in (7, 30, 90) if (ck := score_check(c["d1"], H, macro=c.get("macro_arr"))) is not None}
     return {"ticker": c["ticker"], "snaps": snaps, "alignment": mtf_alignment(snaps), "lab": lab, "peers": pc,
             "signals": sigs, "checks": checks,
             "horizons": horizon_outlook(c, snaps, c.get("event_net", 0.0), 0.0, checks)}
