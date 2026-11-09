@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "5.0.0"
+__version__ = "5.2.0"
 
 import functools
 import numpy as np
@@ -41,6 +41,23 @@ MIN_EDGE_PTS = 3.0            # โอกาส TP ก่อน SL ต้อง�
 MIN_N_EFF = 8                 # ตัวอย่างอิสระขั้นต่ำของสถิติ
 MIN_BT_TRADES = 5
 
+# ───────────── Research-based (v5.1) ─────────────
+# Trend ensemble: Donchian หลาย lookback รวมเป็นคะแนนเดียว (Zarattini, Pagani & Barbon 2025)
+DONCHIAN_LB = (20, 40, 60, 90, 120)
+# Momentum เทียบตลาด (cross-sectional): งานวิจัย SSRN 2949379 พบว่าในคริปโตแบบ cross-sectional ให้ Sharpe ดีกว่า
+MOM_LB = (30, 90)          # วัน · ใช้ผลตอบแทนปรับความผันผวน (Grobys et al. 2025: momentum crash แรง → ต้องปรับตาม vol)
+XS_HOLD = 7                # backtest การจัดอันดับ: ถือ 7 วันแล้วจัดใหม่
+XS_TOP = 5                 # ถือ 5 อันดับแรก
+# Mean reversion ระยะสั้น: Ekström (2025) พบ BTC รายชั่วโมงเด้งกลับหาค่าเฉลี่ย แต่รายวันเป็นเทรนด์
+# → ใช้ "ย่อในเทรนด์ขาขึ้น": 1D ขาขึ้น + 4H ต่ำกว่าเส้นกลาง Bollinger ≤ -1.5 SD เป็นจังหวะเข้า
+MR_Z_4H = -1.5
+
+# ───────────── Watchlist + Scanner ─────────────
+MAX_WATCH = 3              # ผู้ใช้ใส่เหรียญที่สนใจได้สูงสุด 3 เหรียญ ที่เหลือให้ระบบคัดจากตลาด
+SCAN_TOP = 80              # สแกนจาก Volume สูงสุด 80 อันดับ
+SCAN_DEFAULT_EXTRA = 7
+MAX_SPREAD = 0.002         # bid-ask spread ≤ 0.2% (Fil & Kristoufek 2020: ต้นทุนการเทรดกินกำไรมาก)
+
 # ───────────── Misc ─────────────
 TZ_TH = timezone(timedelta(hours=7))
 MAJORS = {"BTC", "ETH"}
@@ -49,7 +66,7 @@ STATUS_TXT = {"🟢": "ซื้อได้", "🟡": "รอย่อ/Confirm"
 REG_TH = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่าน", "DOWN": "ขาลง"}
 STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "PYUSD", "XUSD", "RLUSD",
            "BFUSD", "USDS", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "PAXG", "WBTC", "WBETH", "BNSOL"}
-DEFAULT_WATCH = "BTC, ETH, SOL, XRP, XLM, ADA, NEAR, ENA, HYPE, AAVE, ZEC, BNB, PUMP, UNI, HBAR"
+DEFAULT_WATCH = "BTC, ETH, SOL"
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
 MODEL_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
