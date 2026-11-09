@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import numpy as np
 import pandas as pd
 import sources as na
@@ -12,9 +13,13 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import Callable
 from typing import Literal
-from ai import _r, fallback_strategy, gemini_json, llm_fn, research_agent, strategist_and_risk
-from config import FEE, QUOTE, REG_TH, STABLES, STATUS_TXT, TZ_TH, dist, fbig, fp, fpct, fprob
-from analysis import BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent, touch_prob
+from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, macro_calendar_agent, research_agent,
+                strategist_and_risk)
+from config import (FEE, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
+                    STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
+from analysis import technical_votes
+from analysis import (BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent,
+                      momentum_profile, touch_prob, xs_momentum_backtest, xs_rank)
 from sources import cg_global, external_bundle, fear_greed, fundamentals_for, rss_for
 from market import MarketData, add_indicators, closed_only, fetch_frames
 from signals import build_signal
@@ -360,6 +365,13 @@ def deep_dive_md(c: dict, research: dict, views: dict, pick_by: dict, capital: f
     fdvm = f"{f['fdv_mcap']:.2f}" if f.get("fdv_mcap") else "-"
     proj = f"- **โปรเจกต์:** {rd.get('project', '')} · Tokenomics: {rd.get('tokenomics', '-')}" if rd else ""
     bb = f"- 🐂 {rd.get('bull_case', '-')} · 🐻 {rd.get('bear_case', '-')} · Catalyst {rd.get('catalyst_score')}" if rd else ""
+    tech = c.get("tech") or {"votes": [], "score": 50, "bull": 0, "bear": 0}
+    tech_rows = "\n".join(f"| {t['name']} | {'🟢 บวก' if t['vote'] > 0 else '🔴 ลบ' if t['vote'] < 0 else '⚪ กลาง'} | {t['detail']} |"
+                          for t in tech["votes"])
+    ai_s = f"**{c['buy_final']:.0f}/100**" if c.get("buy_ai") is not None else "— (ไม่มี AI)"
+    score_sec = (f"คะแนนควรซื้อ AI {ai_s} · ระบบ **{c.get('buy_sys', 0):.0f}/100** · มุมมอง **{outlook_label(c) if 'buy_sys' in c else '-'}** · "
+                 f"โอกาสขึ้น (สถิติ) **{fprob(c.get('p_up_h'))}** · เทคนิคเห็นตรงกัน {tech['score']:.0f}/100 "
+                 f"(บวก {tech['bull']} · ลบ {tech['bear']}) · ข่าวข้างหน้า {c.get('event_net', 0):+.2f}")
     return f"""### 🪙 {f.get('name') or c['ticker']} ({c['ticker']}) · {fp(c['price'])}
 **⏱ ระยะกลาง:** {m['status']} {STATUS_TXT[m['status']]} · **🏦 ระยะยาว:** {l['status']} {STATUS_TXT[l['status']]} · **Regime:** {REG_TH[cf['regime']]} · **Score:** {c['score']:.0f}/100
 
@@ -370,6 +382,15 @@ def deep_dive_md(c: dict, research: dict, views: dict, pick_by: dict, capital: f
 
 **❌ มุมมองผิดเมื่อ:** {invalid}
 {watch}
+
+#### 🧮 คะแนน & เทคนิคที่ใช้ตัดสิน
+{score_sec}
+
+| เทคนิค | ผล | รายละเอียด |
+|---|---|---|
+{tech_rows}
+
+*คะแนนควรซื้อ ≠ โอกาสชนะ · โอกาสขึ้นมาจากสถิติย้อนหลังของเหรียญนี้ในสภาพตลาดคล้ายกัน ไม่รับประกันอนาคต*
 
 #### 🎯 แผนระยะกลาง (Swing {m['hold']})
 | จุด | ราคา | ห่างจากตอนนี้ | โอกาส / เวลา | ทำอะไร |
@@ -493,8 +514,8 @@ def _noop(_: str) -> None:
 
 @dataclass
 class RunConfig:
-    watch: list[str]
-    n_extra: int = 5
+    watch: list[str]         # เหรียญที่ผู้ใช้สนใจ (ใช้แค่ MAX_WATCH ตัวแรก)
+    n_extra: int = SCAN_DEFAULT_EXTRA
     horizon: int = 30        # กรอบเวลาที่สนใจ (วัน) ใช้จัดอันดับโอกาสและให้ AI คัดเหรียญ
     min_qvol: float = 20e6
     cg_key: str = ""
@@ -533,20 +554,35 @@ def detect_setups(d: pd.DataFrame) -> list[str]:
     return tags
 
 
-def scan_universe(md: MarketData, exclude: set[str], n: int, min_qvol: float, top: int = 60,
-                  progress: Callable[[float, str], None] | None = None) -> tuple[list[str], dict[str, list[str]]]:
-    """คัดเหรียญเพิ่มจาก Top volume · คืน (symbols, tags รายเหรียญ)"""
+def scan_universe(md: MarketData, exclude: set[str], n: int, min_qvol: float, top: int = SCAN_TOP,
+                  progress: Callable[[float, str], None] | None = None) -> dict:
+    """AI Market Scanner — คัดเหรียญที่น่าสนใจจากตลาด ณ ตอนนี้ (Spot USDT สภาพคล่องสูง)
+
+    1) กรอง: ไม่ใช่ stablecoin/leveraged token · Volume ≥ min_qvol · spread ≤ MAX_SPREAD
+    2) คำนวณทุกเหรียญ (รวม Watchlist เพื่อใช้เป็นตลาดอ้างอิง): Momentum ปรับความผันผวนเทียบตลาด (percentile),
+       Trend ensemble (Donchian 5 lookback), สัญญาณเทคนิค, รูปแบบกราฟ, order flow
+    3) Backtest การจัดอันดับย้อนหลัง → บอกว่าอันดับนี้ "เคยมี edge" หรือไม่
+    คืน {"picks", "tags", "info", "xs_bt", "universe", "dropped_spread", "ref_risk_adj"}
+    """
+    out = {"picks": [], "tags": {}, "info": {}, "xs_bt": None, "universe": 0, "dropped_spread": 0, "ref_risk_adj": []}
     t = md.tickers()
-    t = t[~t["base"].isin(STABLES | exclude) & ~t["base"].str.endswith(("UP", "DOWN", "BULL", "BEAR"))]
-    t = t[(t["quoteVolume"] >= min_qvol) & (t["count"] > 20_000)].sort_values("quoteVolume", ascending=False).head(top)
+    t = t[~t["base"].isin(STABLES) & ~t["base"].str.endswith(("UP", "DOWN", "BULL", "BEAR"))]
+    t = t[(t["quoteVolume"] >= min_qvol) & (t["count"] > 20_000)]
+    if "spread" in t:
+        wide = t["spread"].notna() & (t["spread"] > MAX_SPREAD)
+        out["dropped_spread"] = int(wide.sum())
+        t = t[~wide]
+    t = t.sort_values("quoteVolume", ascending=False).head(top)
     if t.empty:
-        return [], {}
+        return out
     fr = fetch_frames(md, list(t.index), ("1d",), progress)
-    rows, tags = [], {}
+    rows, prof, closes = [], {}, {}
     for s, f in fr.items():
         if "1d" not in f or len(f["1d"]) < 120:
             continue
         d = closed_only(add_indicators(f["1d"]))
+        closes[s] = d["close"]
+        prof[s] = momentum_profile(d)
         last = d.iloc[-1]
         vr = t.loc[s, "quoteVolume"] / max(d["qvol"].iloc[-20:].mean(), 1)
         sc = 2 * min(vr, 3) + (45 <= last.rsi <= 70) + (last.close > last.ema50) + (last.macd_h > 0)
@@ -555,17 +591,43 @@ def scan_universe(md: MarketData, exclude: set[str], n: int, min_qvol: float, to
         pats = chart_patterns(d)
         tg += [f"{p['name']} ({p['state']})" for p in pats if p["bias"] == "bull"]
         sc += 0.5 * len(tg) - sum(p["bias"] == "bear" for p in pats)
-        tags[s] = tg
+        tr = prof[s]["trend"]
+        if tr is not None:
+            sc += 2 * tr - (2 if tr == 0 else 0)  # ไม่มี lookback ไหนอยู่ในเทรนด์ = ลงโทษ
+            if tr >= 0.6:
+                tg.append(f"Trend {tr * 5:.0f}/5")
+        of = prof[s]["orderflow"]
+        if of is not None and of > 0.02:
+            sc += 0.5
+            tg.append(f"แรงซื้อเชิงรุกเพิ่ม {of * 100:+.1f}%")
+        out["tags"][s] = tg
         rows.append((s, sc))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in rows[:n]], tags
+    pct = xs_rank(prof)
+    for s, sc in rows:
+        out["info"][s] = {**prof[s], "xs_pct": pct.get(s), "scan_score": sc}
+    # Momentum เทียบตลาด: percentile สูง = แข็งกว่าเหรียญส่วนใหญ่ในตลาด (cross-sectional)
+    ranked = sorted(((s, sc + 3 * (pct.get(s) or 0)) for s, sc in rows), key=lambda x: x[1], reverse=True)
+    out["picks"] = [s for s, _ in ranked if s[: -len(QUOTE)] not in exclude][:n]
+    out["universe"] = len(rows)
+    out["ref_risk_adj"] = [v["risk_adj"] for v in prof.values() if v["risk_adj"] is not None]
+    if len(closes) >= 10:
+        out["xs_bt"] = xs_momentum_backtest(pd.DataFrame(closes))
+    return out
+
+
+def market_pct(x: float | None, ref: list[float]) -> float | None:
+    """percentile ของค่า x เทียบกับตลาดอ้างอิง"""
+    if x is None or not ref:
+        return None
+    return float(np.mean(np.asarray(ref) <= x))
 
 
 def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = None) -> pd.DataFrame:
     """จัดอันดับเหรียญที่มีโอกาสขึ้นในกรอบเวลา horizon วัน (ตัวเลขจากสถิติ + เหตุผลประกอบ)
 
-    คะแนนโอกาส = 40% โอกาสปิดสูงกว่าวันนี้ + 25% upside ที่มีโอกาส 50% แตะ (ปรับด้วยความผันผวน)
-                 + 15% สถานะจุดเข้า + 10% รูปแบบกราฟ + 10% ข่าว/อีเวนต์ — ไม่ใช่การรับประกัน
+    คะแนนโอกาส = 35% โอกาสปิดสูงกว่าวันนี้ + 20% upside ที่มีโอกาส 50% แตะ (ปรับด้วยความผันผวน)
+                 + 15% สถานะจุดเข้า + 10% รูปแบบกราฟ + 10% ข่าว/อีเวนต์
+                 + 10% Momentum เทียบตลาด/Trend ensemble — ไม่ใช่การรับประกัน
     """
     H = min((h for h in (7, 14, 30, 60, 90, 180) if h >= horizon), default=180)
     rows = []
@@ -580,10 +642,17 @@ def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = No
         rd = ((research or {}).get(c["ticker"]) or {}).get("data") or {}
         cat = (rd.get("catalyst_score") or 0) / 100
         pattern_score = sum({"bull": 1, "bear": -1}.get(p["bias"], 0) for p in c.get("patterns", []))
-        s = 40 * v["p_up"] + 25 * float(np.clip(rr / 2, 0, 1)) + 15 * {"🟢": 1, "🟡": 0.5, "🔴": 0}[c["med"]["status"]]
+        mo = c.get("mom") or {}
+        xs, tr = c.get("xs_pct"), mo.get("trend")
+        s = 35 * v["p_up"] + 20 * float(np.clip(rr / 2, 0, 1)) + 15 * {"🟢": 1, "🟡": 0.5, "🔴": 0}[c["med"]["status"]]
         s += 10 * float(np.clip(0.5 + pattern_score / 4, 0, 1))
         s += 10 * float(np.clip(0.5 + news.get("score", 0) * news.get("confidence", 0) + cat / 2, 0, 1))
+        s += 10 * (0.5 * (xs if xs is not None else 0.5) + 0.5 * (tr if tr is not None else 0.5))
         why = [f"{p['name']} {p['state']}" for p in c.get("patterns", []) if p["bias"] == "bull"]
+        if xs is not None and xs >= 0.7:
+            why.append(f"Momentum แข็งกว่าตลาด {xs * 100:.0f}%")
+        if c["med"].get("mr4h"):
+            why.append("ย่อในเทรนด์ขาขึ้น (4H)")
         why += c.get("scan_tags", [])[:2]
         if news.get("score", 0) >= 0.12:
             why.append(f"ข่าวบวก {news['score']:+.2f}")
@@ -594,10 +663,13 @@ def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = No
         warn = [f"{p['name']} ({BIAS_TH['bear']})" for p in c.get("patterns", []) if p["bias"] == "bear"]
         if c["cf"]["regime"] == "DOWN":
             warn.append("Regime ขาลง")
+        if xs is not None and xs <= 0.3:
+            warn.append(f"Momentum อ่อนกว่าตลาด ({xs * 100:.0f}%)")
         if news.get("score", 0) <= -0.12:
             warn.append(f"ข่าวลบ {news['score']:+.2f}")
         rows.append({"Ticker": ("⭐" if c.get("is_pick") else "") + c["ticker"], "คะแนนโอกาส": round(float(s)),
                      f"โอกาสปิดสูงกว่าวันนี้ใน {H} วัน": fprob(v["p_up"]),
+                     "Momentum เทียบตลาด": fprob(xs), "Trend": f"{tr * 5:.0f}/5" if tr is not None else "-",
                      "50% แตะ ≥": f"{fp(v['reach50'])} ({fpct(up50)})", "30% แตะ ≥": f"{fp(v['reach30'])} ({dist(c, v['reach30'])})",
                      "ย่อลึก (50%)": f"{fp(v['dip50'])} ({fpct(dn50)})",
                      "จุดเข้า": f"{c['med']['status']} {fp(c['med']['zone'][0])}–{fp(c['med']['zone'][1])}",
@@ -605,6 +677,294 @@ def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = No
                      "ตัวอย่างอิสระ": v["n_eff"]})
     df = pd.DataFrame(rows)
     return df.sort_values("คะแนนโอกาส", ascending=False).reset_index(drop=True) if len(df) else df
+
+
+def table_market_picks(coins: list[dict]) -> pd.DataFrame:
+    """เหรียญที่ AI Market Scanner คัดจากตลาด (⭐) พร้อมเหตุผลเชิงตัวเลข และสถานะผ่านเกณฑ์จุดเข้า"""
+    rows = []
+    for c in sorted([c for c in coins if c.get("is_pick")], key=lambda c: -c["score"]):
+        mo = c.get("mom") or {}
+        r = mo.get("ret") or {}
+        fails = c.get("gate_fails") or []
+        rows.append({"เหรียญ": c["ticker"], "ราคา": fp(c["price"]), "Momentum เทียบตลาด": fprob(c.get("xs_pct")),
+                     "Trend (Donchian)": f"{mo['trend'] * 5:.0f}/5" if mo.get("trend") is not None else "-",
+                     "30D / 90D": f"{fpct(r.get(30), 0)} / {fpct(r.get(90), 0)}",
+                     "ความผันผวน/ปี": f"{mo['vol'] * 100:.0f}%" if mo.get("vol") and np.isfinite(mo["vol"]) else "-",
+                     "สัญญาณ Scanner": " · ".join(c.get("scan_tags", [])[:4]) or "-",
+                     "จุดเข้า": "✅ ผ่านเกณฑ์" if not fails else f"{c['med']['status']} ยังไม่ยืนยัน",
+                     "โซนซื้อ": f"{fp(c['med']['zone'][0])}–{fp(c['med']['zone'][1])}",
+                     "ยังไม่ผ่านเพราะ": " · ".join(fails[:2]) or "-"})
+    return pd.DataFrame(rows)
+
+
+# ───────────────────────── v5.2: คะแนนควรซื้อ / Roadmap / แผนเข้า-ออก / Export ─────────────────────────
+DIR_EMO = {"POSITIVE": "🟢 +", "NEGATIVE": "🔴 −", "MIXED": "⚪ ±"}
+_IMPACT_W = {"HIGH": 1.0, "MEDIUM": 0.6, "LOW": 0.3}
+_CERT_W = {"CONFIRMED": 1.0, "EXPECTED": 0.7, "RUMOR": 0.3}
+_DIR_V = {"POSITIVE": 1, "NEGATIVE": -1, "MIXED": 0}
+
+
+def horizon_bucket(horizon: int) -> int:
+    return min((h for h in (7, 14, 30, 60, 90, 180) if h >= horizon), default=180)
+
+
+def parse_event_date(s: str) -> tuple[pd.Timestamp | None, bool]:
+    """'2026-12-10' / '2026-12' / '2026-Q1' → (วันที่, ประมาณการหรือไม่)"""
+    s = (s or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            return pd.Timestamp(s), False
+        if re.fullmatch(r"\d{4}-\d{2}", s):
+            return pd.Timestamp(s + "-01"), True
+        q = re.fullmatch(r"(\d{4})-?Q([1-4])", s, re.I)
+        if q:
+            return pd.Timestamp(f"{q.group(1)}-{3 * int(q.group(2)) - 2:02d}-01"), True
+    except ValueError:
+        pass
+    return None, True
+
+
+def build_roadmap(research: dict, macro_cal: dict | None, tickers: list[str], today: pd.Timestamp | None = None) -> list[dict]:
+    """รวมอีเวนต์ในอนาคตจาก Research รายเหรียญ + ปฏิทินมหภาค → เรียงตามวันที่ (ตัดอีเวนต์ที่ผ่านไปแล้ว)"""
+    now = today if today is not None else pd.Timestamp.now(tz=TZ_TH)
+    today = (now.tz_localize(None) if now.tzinfo else now).normalize()
+    rows = []
+    for t, r in (research or {}).items():
+        for e in ((r or {}).get("data") or {}).get("events", []):
+            rows.append({"coins": [t], "scope": t, **{k: e.get(k) for k in ("date", "title", "impact", "certainty",
+                                                                             "source_url", "why")},
+                         "type": e.get("type", "OTHER"), "direction": e.get("direction") or "MIXED",
+                         "verified": (r or {}).get("verified", False)})
+    for e in (macro_cal or {}).get("events", []):
+        cs = [x.upper().replace(QUOTE, "") for x in e.get("coins") or []]
+        rows.append({"coins": cs, "scope": ", ".join(cs) if cs else "🌐 ตลาดรวม", "type": e.get("category", "OTHER"),
+                     **{k: e.get(k) for k in ("date", "title", "impact", "certainty", "source_url", "why", "direction")},
+                     "verified": (macro_cal or {}).get("verified", False)})
+    out, seen = [], set()
+    for r in rows:
+        dt, approx = parse_event_date(r.get("date"))
+        if dt is None or dt + pd.Timedelta(days=31 if approx else 0) < today:
+            continue
+        key = (r["scope"], (r.get("title") or "")[:40].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        r.update(dt=dt, approx=approx, days=int((dt - today).days),
+                 has_src=str(r.get("source_url") or "").startswith("http"))
+        out.append(r)
+    return sorted(out, key=lambda r: r["dt"])
+
+
+def event_net(roadmap: list[dict], ticker: str, horizon_days: int = 90) -> float:
+    """ผลรวมข่าว/อีเวนต์ข้างหน้าของเหรียญ -1..1 (ทิศทาง × ผลกระทบ × ความแน่นอน · ข่าวทั้งตลาดน้ำหนักครึ่ง)"""
+    s = 0.0
+    for r in roadmap:
+        own = ticker in r["coins"]
+        if not own and r["coins"]:
+            continue
+        w = _IMPACT_W.get(r.get("impact"), 0.3) * _CERT_W.get(r.get("certainty"), 0.3) * (1.0 if own else 0.5)
+        w *= 1.0 if r["days"] <= horizon_days else 0.5
+        w *= 1.0 if r.get("has_src") else 0.5  # ไม่มีลิงก์อ้างอิง → ลดน้ำหนัก
+        s += _DIR_V.get(r.get("direction"), 0) * w
+    return float(np.tanh(s / 2))
+
+
+def entry_points(c: dict) -> float:
+    if not c.get("gate_fails"):
+        return 100.0
+    return {"🟢": 70.0, "🟡": 40.0, "🔴": 0.0}[c["med"]["status"]]
+
+
+def buy_score_sys(c: dict) -> float:
+    """คะแนนควรซื้อของระบบ 0-100 = เทคนิคเห็นตรงกัน 35% + โอกาสขึ้น (สถิติ) 35% + สถานะจุดเข้า 15% + ข่าว/อีเวนต์ 15%"""
+    n = c.get("news") or {}
+    news = 0.5 * n.get("score", 0) * n.get("confidence", 0) + 0.5 * c.get("event_net", 0.0)
+    p_up = c.get("p_up_h")
+    s = 0.35 * c["tech"]["score"] + 0.35 * (p_up * 100 if p_up is not None else 50) + 0.15 * entry_points(c)
+    s += 0.15 * (50 + 50 * float(np.clip(news, -1, 1)))
+    return float(np.clip(s, 0, 100))
+
+
+def outlook_label(c: dict) -> str:
+    s, p = c.get("buy_final", c.get("buy_sys", 50)), c.get("p_up_h") or 0.5
+    t = c["tech"]
+    if s >= 62 and p >= 0.55 and t["bull"] > t["bear"]:
+        return "🟢 บวก"
+    if s <= 42 or (t["bear"] > t["bull"] and p < 0.5):
+        return "🔴 ลบ"
+    return "⚪ กลาง"
+
+
+def decision_table(coins: list[dict], views: dict, horizon: int) -> pd.DataFrame:
+    """ตารางตัดสินใจ: คะแนนควรซื้อ (AI/ระบบ) · โอกาสขึ้น · เทคนิคไหนบวก/ลบ · ข่าวข้างหน้า · มุมมอง +/−"""
+    H = horizon_bucket(horizon)
+    rows = []
+    for c in sorted(coins, key=lambda c: -c.get("buy_final", 0)):
+        t, v = c["tech"], views.get(c["ticker"]) or {}
+        pos = [x["name"] for x in t["votes"] if x["vote"] > 0]
+        neg = [x["name"] for x in t["votes"] if x["vote"] < 0]
+        ft = c["med"]["ft1"] or {}
+        rows.append({
+            "เหรียญ": ("⭐" if c.get("is_pick") else "") + c["ticker"],
+            "มุมมอง": outlook_label(c),
+            "คะแนนควรซื้อ (AI)": f"{c['buy_final']:.0f}/100" if c.get("buy_ai") is not None else "-",
+            "คะแนนระบบ": f"{c['buy_sys']:.0f}/100",
+            f"โอกาสขึ้นใน {H} วัน (สถิติ)": fprob(c.get("p_up_h")),
+            "TP1 ก่อน SL": fprob(ft.get("p_tp")),
+            "เทคนิค บวก/ลบ/กลาง": f"{t['bull']} / {t['bear']} / {t['neutral']}",
+            "✅ เทคนิคที่บวก": " · ".join(pos) or "-", "❌ เทคนิคที่ลบ": " · ".join(neg) or "-",
+            "ข่าวข้างหน้า": f"{c.get('event_net', 0):+.2f}",
+            "AI สรุปจากเทคนิค": " · ".join(v.get("key_techniques") or []) or "-"})
+    return pd.DataFrame(rows)
+
+
+def roadmap_df(roadmap: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "วันที่": r["dt"].strftime("%Y-%m-%d") + (" (ประมาณ)" if r["approx"] else ""), "อีก (วัน)": r["days"],
+        "เหรียญ": r["scope"], "ประเภท": r["type"], "เหตุการณ์": r.get("title") or "-",
+        "ผลที่คาด": DIR_EMO.get(r.get("direction"), "⚪ ±"), "ผลกระทบ": r.get("impact"), "ความแน่นอน": r.get("certainty"),
+        "เหตุผล": r.get("why") or "-", "ที่มา": r.get("source_url") if r.get("has_src") else "⚠️ ไม่มีลิงก์"}
+        for r in roadmap])
+
+
+def _fill_days(c: dict) -> int:
+    if not c.get("gate_fails") or c["med"]["status"] == "🟢":
+        return max(1, SIGNAL_EXPIRY_H // 24)
+    return 14 if c["med"]["status"] == "🟡" else 0
+
+
+def trade_plan_table(coins: list[dict], ts: datetime) -> pd.DataFrame:
+    """แผนเข้า-ออกที่ชัดเจน: ทำอะไร ที่ราคาไหน จนถึงวันไหน"""
+    rows = []
+    for c in coins:
+        m = c["med"]
+        fails = c.get("gate_fails") or []
+        if not fails:
+            act, cond = "✅ เข้าได้", "ผ่านเกณฑ์ครบ ตั้ง Limit ได้เลย"
+        elif m["status"] == "🔴":
+            act, cond = "⛔ ห้ามเข้า", " · ".join(m["reasons"][:2]) or "แนวโน้มขาลง"
+        else:
+            act, cond = "⏳ ตั้งรอ", "เข้าเมื่อ: ราคาลงมาในโซน + " + (" · ".join(fails[:2]) if fails else "")
+        fd = _fill_days(c)
+        rows.append({
+            "เหรียญ": ("⭐" if c.get("is_pick") else "") + c["ticker"], "ราคา": fp(c["price"]), "ทำอะไร": act,
+            "เข้าไม้ 1 (50%)": f"Limit {fp(m['zone'][1])}" if fd else "-",
+            "เข้าไม้ 2 (50%)": f"Limit {fp(m['zone'][0])}" if fd else "-",
+            "เงื่อนไข": cond, "ตั้งรอถึง": (ts + pd.Timedelta(days=fd)).strftime("%d/%m/%Y") if fd else "-",
+            "🛑 Stop Loss": f"{fp(m['sl'])} ({fpct(m['sl'] / m['entry'] - 1)})",
+            "✅ TP1 ขาย 50%": f"{fp(m['tp1'])} ({fpct(m['tp1'] / m['entry'] - 1)})",
+            "🚀 TP2 ขายที่เหลือ": f"{fp(m['tp2'])} ({fpct(m['tp2'] / m['entry'] - 1)})",
+            "หลัง TP1": f"เลื่อน SL → {fp(m['entry'])} (ทุน)",
+            "⏳ ไม่ถึง TP1 ขายออกวันที่": (ts + pd.Timedelta(days=fd + m["tstop"])).strftime("%d/%m/%Y") if fd else "-",
+            "R:R": f"1:{m['rr1']:.1f}"})
+    return pd.DataFrame(rows)
+
+
+def analysis_export_df(res: dict, horizon: int) -> pd.DataFrame:
+    """ไฟล์บันทึกผลวิเคราะห์ (1 แถว/เหรียญ) สำหรับเก็บไว้ทำ Backtest/Forward test ภายหลัง"""
+    ts = res["ts"]
+    H = horizon_bucket(horizon)
+    views = (res.get("port") or {}).get("views") or {}
+    rows = []
+    for c in res["coins"]:
+        m, l = c["med"], c["long"]
+        n = c.get("news") or {}
+        rows.append({
+            "run_ts_utc": pd.Timestamp(ts).tz_convert("UTC").isoformat(), "run_date_th": ts.strftime("%Y-%m-%d"),
+            "app_version": __version__, "ticker": c["ticker"], "source": "scanner" if c.get("is_pick") else "watchlist",
+            "price": c["price"], "macro": res["macro"]["regime"], "regime": c["cf"]["regime"],
+            "med_status": m["status"], "passed_gate": not c.get("gate_fails"), "gate_fails": " | ".join(c.get("gate_fails") or []),
+            "entry_lo": m["zone"][0], "entry_hi": m["zone"][1], "entry_mid": m["entry"], "sl": m["sl"],
+            "tp1": m["tp1"], "tp2": m["tp2"], "rr1": m["rr1"], "fill_days": _fill_days(c), "time_stop_days": m["tstop"],
+            "horizon_days": H, "p_up_h": c.get("p_up_h"), "p_tp_first": (m["ft1"] or {}).get("p_tp"),
+            "be_win": m["be_win"], "win_sys": m["win_sys"],
+            "buy_sys": round(c.get("buy_sys", 0), 1), "buy_ai": c.get("buy_ai"), "buy_final": round(c.get("buy_final", 0), 1),
+            "outlook": outlook_label(c), "ai_outlook": (views.get(c["ticker"]) or {}).get("outlook"),
+            "tech_score": round(c["tech"]["score"], 1), "tech_bull": c["tech"]["bull"], "tech_bear": c["tech"]["bear"],
+            "tech_pos": " | ".join(x["name"] for x in c["tech"]["votes"] if x["vote"] > 0),
+            "tech_neg": " | ".join(x["name"] for x in c["tech"]["votes"] if x["vote"] < 0),
+            "xs_pct": c.get("xs_pct"), "trend": (c.get("mom") or {}).get("trend"),
+            "news_score": n.get("score"), "event_net": c.get("event_net"),
+            "bt_n": c["bt"]["n"], "bt_expectancy": c["bt"]["expectancy"], "bt_oos_expectancy": c["bt"]["oos_expectancy"],
+            "long_status": l["status"], "dca1": l["tiers"][0], "dca2": l["tiers"][1], "dca3": l["tiers"][2],
+            "long_stop": l["stop"], "long_tp1": l["tp1"]})
+    return pd.DataFrame(rows)
+
+
+def evaluate_exports(df: pd.DataFrame, md: MarketData, now: pd.Timestamp | None = None) -> dict:
+    """ตรวจไฟล์ผลวิเคราะห์เก่ากับราคาจริงหลังจากนั้น (Forward test · ใช้แท่ง 1D ที่เปิดหลังเวลาวิเคราะห์)
+
+    แผนระยะกลาง: ได้ของเมื่อ Low ≤ entry_hi ภายใน fill_days → จากนั้น SL ก่อน TP1 (แท่งเดียวกันนับ SL) / time stop
+    โอกาสขึ้น: ราคาปิดหลัง horizon_days เทียบราคาตอนวิเคราะห์ → เทียบกับ p_up_h ที่ประเมินไว้ (calibration)
+    """
+    now = now or pd.Timestamp.now(tz="UTC")
+    df = df.copy()
+    syms = [f"{t}{QUOTE}" for t in df["ticker"].unique()]
+    frames = fetch_frames(md, syms, ("1d",))
+    out = []
+    for _, p in df.iterrows():
+        d = (frames.get(f"{p['ticker']}{QUOTE}") or {}).get("1d")
+        rec = p.to_dict()
+        rec.update(outcome="ไม่มีข้อมูล", R=None, ret_h=None, up_h=None, filled=False)
+        if d is None:
+            out.append(rec)
+            continue
+        d = closed_only(d, now)
+        x = d[d.index > pd.Timestamp(p["run_ts_utc"])]
+        H = int(p.get("horizon_days") or 30)
+        if len(x) >= H:
+            rec["ret_h"] = float(x["close"].iloc[H - 1] / p["price"] - 1)
+            rec["up_h"] = rec["ret_h"] > 0
+        fd, ts_ = int(p.get("fill_days") or 0), int(p.get("time_stop_days") or 30)
+        if fd <= 0 or pd.isna(p.get("entry_hi")):
+            rec["outcome"] = "ไม่ได้แนะนำให้เข้า"
+            out.append(rec)
+            continue
+        res_, filled_at, entry = "⏳ รอได้ของ", None, None
+        for k in range(len(x)):
+            bar = x.iloc[k]
+            if filled_at is None:
+                if bar.low <= p["entry_hi"]:
+                    filled_at, entry = k, min(p["entry_hi"], bar.open)
+                elif k + 1 >= fd:
+                    res_ = "หมดเวลา (ไม่ได้ของ)"
+                    break
+                else:
+                    continue
+            if bar.low <= p["sl"]:
+                res_, rec["R"] = "❌ LOSS", -1.0
+                break
+            if bar.high >= p["tp1"]:
+                res_, rec["R"] = "✅ WIN", (p["tp1"] - entry) / (entry - p["sl"])
+                break
+            if k - filled_at + 1 >= ts_:
+                rec["R"] = (bar.close - entry) / (entry - p["sl"])
+                res_ = "✅ WIN (time stop)" if rec["R"] > 0 else "❌ LOSS (time stop)"
+                break
+        else:
+            if filled_at is not None:
+                res_ = "⏳ ถืออยู่"
+        rec["filled"] = filled_at is not None
+        rec["outcome"] = res_
+        out.append(rec)
+    ev = pd.DataFrame(out)
+    done = ev[ev["outcome"].str.contains("WIN|LOSS", na=False)]
+    summ = {"rows": len(ev), "closed": len(done),
+            "win_rate": float(done["outcome"].str.contains("WIN").mean()) if len(done) else None,
+            "avg_R": float(done["R"].mean()) if len(done) else None,
+            "est_tp_first": float(done["p_tp_first"].mean()) if len(done) and done["p_tp_first"].notna().any() else None}
+    hz = ev[ev["up_h"].notna()]
+    summ["n_h"] = len(hz)
+    summ["up_rate"] = float(hz["up_h"].astype(bool).mean()) if len(hz) else None
+    summ["est_p_up"] = float(hz["p_up_h"].mean()) if len(hz) and hz["p_up_h"].notna().any() else None
+    buckets = []
+    if len(hz):
+        b = pd.cut(hz["buy_final"].astype(float), [-1, 40, 55, 70, 101], labels=["<40", "40-55", "55-70", "≥70"])
+        for lab, g in hz.groupby(b, observed=True):
+            buckets.append({"คะแนนควรซื้อ": str(lab), "จำนวน": len(g), "ขึ้นจริง": fprob(g["up_h"].astype(bool).mean()),
+                            "ผลตอบแทนเฉลี่ย": fpct(g["ret_h"].mean()), "โอกาสที่ประเมินไว้": fprob(g["p_up_h"].mean())})
+    summ["buckets"] = pd.DataFrame(buckets)
+    return {"table": ev, "summary": summ}
 
 
 def table_patterns(coins: list[dict]) -> pd.DataFrame:
@@ -644,12 +1004,16 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     t0 = time.perf_counter()
     progress("📡 Market Data Agent: ตรวจรายชื่อคู่เทรด…")
     valid = set(md.tickers().index)
-    watch = [w for w in cfg.watch if f"{w}{QUOTE}" in valid]
-    missing = [w for w in cfg.watch if f"{w}{QUOTE}" not in valid]
-    extra, scan_tags = ([], {})
+    req = list(dict.fromkeys(cfg.watch))
+    watch_dropped = req[MAX_WATCH:]          # ใส่เกิน 3 เหรียญ → ใช้ 3 ตัวแรก ที่เหลือให้ Scanner ตัดสิน
+    req = req[:MAX_WATCH]
+    watch = [w for w in req if f"{w}{QUOTE}" in valid]
+    missing = [w for w in req if f"{w}{QUOTE}" not in valid]
+    scan = {"picks": [], "tags": {}, "info": {}, "xs_bt": None, "universe": 0, "dropped_spread": 0, "ref_risk_adj": []}
     if cfg.n_extra:
-        progress("🔎 Market Scanner: คัดเหรียญจาก Volume สูงสุด…")
-        extra, scan_tags = scan_universe(md, set(watch) | {"BTC"}, cfg.n_extra, cfg.min_qvol, progress=bar)
+        progress("🔎 AI Market Scanner: จัดอันดับ Momentum เทียบตลาด + Trend + สัญญาณเทคนิค…")
+        scan = scan_universe(md, set(watch) | {"BTC"}, cfg.n_extra, cfg.min_qvol, progress=bar)
+    extra, scan_tags = scan["picks"], scan["tags"]
     syms = list(dict.fromkeys([f"BTC{QUOTE}", *[f"{w}{QUOTE}" for w in watch], *extra]))
     progress("📡 Market Data Agent: ดึง 4H/1D/1W แบบขนาน…")
     frames = fetch_frames(md, syms, ("4h", "1d", "1w"), bar)
@@ -680,6 +1044,8 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
         if c:
             c["is_pick"] = s in extra
             c["scan_tags"] = scan_tags.get(s, [])
+            info = scan["info"].get(s) or {}
+            c["xs_pct"] = info.get("xs_pct") if info else market_pct(c["mom"]["risk_adj"], scan["ref_risk_adj"])
             coins.append(c)
         else:
             skipped.append(f"{t}: ข้อมูลไม่พอ")
@@ -705,6 +1071,11 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     base = [c for c in coins if not c["is_pick"] and (c["ticker"] != "BTC" or "BTC" in cfg.watch)]
     analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
 
+    H = horizon_bucket(cfg.horizon)
+    for c in analyzed:  # เทคนิครายตัว (หลังได้ Momentum เทียบตลาด) + โอกาสขึ้นตามกรอบเวลาที่เลือก
+        c["tech"] = technical_votes(c)
+        c["p_up_h"] = (c["fc"].get(H) or {}).get("p_up")
+
     signals, watch_only = [], []
     for c in analyzed:
         sig, fails = build_signal(c, macro, c.get("news"), bool(c.get("news_block")))
@@ -715,22 +1086,42 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
             watch_only.append(c["ticker"])
 
     research = {"by_ticker": {}, "log": []}
+    macro_cal = None
     if cfg.client and cfg.ai_agents:
         short = sorted(analyzed, key=lambda c: c["score"], reverse=True)[: cfg.n_research]
         research = research_agent(cfg.client, cfg.model_research, short, cfg.research_cache, progress,
                                   news["items"], na.headlines,
                                   lambda c: [f"{x['date']} {x['src']}: {x['title']}"
                                              for x in rss_for(c["ticker"], c["fund"].get("name"), rss)])
+        progress("🗓 Event Calendar Agent: ค้นข่าว/อีเวนต์ 90 วันข้างหน้า…")
+        try:
+            macro_cal = macro_calendar_agent(cfg.client, cfg.model_research, [c["ticker"] for c in analyzed],
+                                             cfg.research_cache)
+        except Exception as e:  # noqa: BLE001 — ปฏิทินล่มไม่ทำให้ทั้งระบบล่ม
+            macro_cal = {"events": [], "errors": [str(e)[:200]]}
+    roadmap = build_roadmap(research["by_ticker"], macro_cal, [c["ticker"] for c in analyzed])
+    for c in analyzed:
+        c["event_net"] = event_net(roadmap, c["ticker"], max(H, 30))
+        c["buy_sys"] = buy_score_sys(c)
+
+    if cfg.client and cfg.ai_agents:
         port = strategist_and_risk(cfg.client, cfg.model, analyzed, research["by_ticker"], macro, corr,
-                                   cfg.n_med, cfg.n_long, progress, cfg.horizon)
+                                   cfg.n_med, cfg.n_long, progress, cfg.horizon, scan.get("xs_bt"))
     else:
         picks = fallback_strategy(analyzed, cfg.n_med, cfg.n_long)
         port = {"picks": picks, "cash": 100 - sum(p["alloc_final"] for p in picks), "strategist": None, "views": {},
                 "risk": None, "errors": [], "mode": "rule-based (ไม่มี API key)"}
+    views = port.get("views") or {}
+    for c in analyzed:  # คะแนน AI ถูกจำกัดให้อยู่ภายใน ±15 ของคะแนนระบบ
+        v = views.get(c["ticker"]) or {}
+        c["buy_ai"] = v.get("buy_score") if v else None
+        c["buy_final"] = enforce_buy_score(c["buy_ai"], c["buy_sys"])
 
     return {"coins": analyzed, "macro": macro, "glob": glob, "fng": fng, "corr": corr, "research": research,
             "port": port, "missing": missing, "skipped": skipped, "rss": rss, "news": news,
-            "signals": signals, "watch_only": watch_only,
+            "signals": signals, "watch_only": watch_only, "watch_dropped": watch_dropped,
+            "scan": {k: scan[k] for k in ("xs_bt", "universe", "dropped_spread")},
+            "roadmap": roadmap, "macro_cal": macro_cal, "horizon": cfg.horizon,
             "elapsed": time.perf_counter() - t0, "btc_d": btc_d, "ts": datetime.now(TZ_TH), "host": md.host}
 
 
