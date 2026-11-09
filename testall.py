@@ -378,3 +378,147 @@ def test_opportunity_rank(fake_md):
     for c in res["coins"]:
         for p in c["patterns"]:
             assert p["target"] > 0 and (p["p_target_60"] is None or 0 <= p["p_target_60"] <= 1)
+
+
+# ───────────── v5.1: Research-based trend / momentum / scanner ─────────────
+class FakeMarketWide(FakeMarket):
+    """ตลาดจำลอง 14 เหรียญ + bid/ask (เหรียญ WIDE มี spread กว้าง)"""
+
+    def __init__(self):
+        super().__init__(tuple(f"{b}USDT" for b in ("BTC", "ETH", "SOL", "XRP", "ADA", "NEAR", "ENA", "HYPE",
+                                                     "AAVE", "ZEC", "BNB", "UNI", "HBAR", "WIDE")))
+
+    def tickers(self):
+        df = super().tickers()
+        df["bidPrice"], df["askPrice"] = 1.0, 1.0005
+        df.loc["WIDEUSDT", "askPrice"] = 1.05
+        mid = (df["bidPrice"] + df["askPrice"]) / 2
+        df["spread"] = (df["askPrice"] - df["bidPrice"]) / mid
+        return df
+
+
+def test_new_indicators(daily):
+    d = indicators.add_indicators(daily)
+    assert {"bb_z", "taker_ratio7", "taker_ratio30"} <= set(d.columns)
+    assert d["taker_ratio7"].dropna().between(0, 1).all()
+
+
+def test_donchian_no_lookahead(daily):
+    d = indicators.add_indicators(daily)
+    full = quant.donchian_trend(d)
+    k = 500
+    cut = quant.donchian_trend(d.iloc[: k + 1])
+    assert np.allclose(full.iloc[: k + 1].to_numpy(), cut.to_numpy(), equal_nan=True)
+    assert full.dropna().between(0, 1).all()
+
+
+def test_donchian_direction():
+    up = _shape(50 * 1.01 ** np.arange(300))       # ขึ้น 1%/วัน
+    dn = _shape(150 * 0.99 ** np.arange(300))      # ลง 1%/วัน
+    assert quant.donchian_trend(up).iloc[-1] == 1.0
+    assert quant.donchian_trend(dn).iloc[-1] == 0.0
+
+
+def test_momentum_profile(daily):
+    p = quant.momentum_profile(indicators.add_indicators(daily))
+    assert set(p["ret"]) == {30, 90} and p["vol"] > 0 and p["risk_adj"] is not None
+    assert 0 <= p["trend"] <= 1
+
+
+def test_xs_backtest_detects_persistent_momentum():
+    rng = np.random.default_rng(7)
+    n, k = 700, 12
+    drifts = np.linspace(-0.002, 0.003, k)  # เหรียญที่ drift สูงยังคงขึ้นต่อ → การจัดอันดับควรชนะตลาด
+    r = rng.normal(drifts, 0.02, (n, k))
+    px = pd.DataFrame(100 * np.exp(np.cumsum(r, axis=0)), columns=[f"C{i}" for i in range(k)],
+                      index=pd.date_range(end="2026-11-06", periods=n, freq="1D", tz="UTC"))
+    bt = quant.xs_momentum_backtest(px)
+    assert bt["n"] >= 12 and bt["excess"] > 0 and 0 <= bt["hit"] <= 1
+    noise = quant.xs_momentum_backtest(px.iloc[:150])
+    assert noise["excess"] is None  # ข้อมูลน้อย → ไม่สรุป
+
+
+def test_scan_universe_filters_and_ranks():
+    from pipeline import scan_universe
+    md = FakeMarketWide()
+    out = scan_universe(md, {"ETH", "SOL", "BTC"}, 5, 1e6)
+    picks = [s[:-4] for s in out["picks"]]
+    assert len(picks) == 5 and not ({"ETH", "SOL", "BTC", "WIDE"} & set(picks))
+    assert out["dropped_spread"] == 1 and out["universe"] == 13
+    assert all(0 < v["xs_pct"] <= 1 for v in out["info"].values())
+    assert out["xs_bt"] is not None and "verdict" in out["xs_bt"]
+
+
+def test_watchlist_capped_to_three():
+    from pipeline import RunConfig, run_pipeline, table_market_picks
+    md = FakeMarketWide()
+    res = run_pipeline(md, RunConfig(watch=["ETH", "SOL", "XRP", "ADA", "NEAR"], n_extra=4, use_news=False))
+    base = {c["ticker"] for c in res["coins"] if not c["is_pick"]}
+    picks = {c["ticker"] for c in res["coins"] if c["is_pick"]}
+    assert base == {"ETH", "SOL", "XRP"} and res["watch_dropped"] == ["ADA", "NEAR"]
+    assert len(picks) == 4 and not (picks & base)
+    assert all(c["xs_pct"] is None or 0 <= c["xs_pct"] <= 1 for c in res["coins"])
+    mp = table_market_picks(res["coins"])
+    assert len(mp) == 4 and "Momentum เทียบตลาด" in mp.columns
+
+
+# ───────────── v5.2: คะแนนควรซื้อ / เทคนิค / Roadmap / Export ─────────────
+def test_technical_votes(coin):
+    c, _ = coin
+    t = quant.technical_votes(c)
+    assert len(t["votes"]) >= 12 and t["bull"] + t["bear"] + t["neutral"] == len(t["votes"])
+    assert 0 <= t["score"] <= 100 and all(v["vote"] in (-1, 0, 1) and v["detail"] for v in t["votes"])
+
+
+def test_parse_event_date():
+    from pipeline import parse_event_date
+    assert parse_event_date("2026-12-10") == (pd.Timestamp("2026-12-10"), False)
+    assert parse_event_date("2027-02") == (pd.Timestamp("2027-02-01"), True)
+    assert parse_event_date("2027-Q2")[0] == pd.Timestamp("2027-04-01")
+    assert parse_event_date("soon")[0] is None
+
+
+def test_roadmap_and_event_net():
+    from pipeline import build_roadmap, event_net, roadmap_df
+    ev = lambda d, dr, imp="HIGH": {"date": d, "type": "UNLOCK", "title": f"ev {d} {dr}", "impact": imp,  # noqa: E731
+                                    "certainty": "CONFIRMED", "source_url": "https://x.y", "direction": dr, "why": "w"}
+    research = {"SOL": {"verified": True, "data": {"events": [ev("2026-12-01", "POSITIVE"), ev("2025-01-01", "POSITIVE")]}},
+                "ENA": {"verified": True, "data": {"events": [ev("2026-11-20", "NEGATIVE")]}}}
+    cal = {"verified": True, "events": [{"date": "2026-12-10", "title": "FOMC", "category": "FED", "coins": [],
+                                         "direction": "MIXED", "impact": "HIGH", "certainty": "CONFIRMED",
+                                         "why": "ลดดอกเบี้ย = +", "source_url": "https://fed.gov"}]}
+    rm = build_roadmap(research, cal, ["SOL", "ENA"], today=pd.Timestamp("2026-11-09"))
+    assert [r["dt"] for r in rm] == sorted(r["dt"] for r in rm) and len(rm) == 3  # ตัดอีเวนต์ปี 2025 ออก
+    assert event_net(rm, "SOL") > 0 > event_net(rm, "ENA")
+    assert event_net(rm, "BTC") == 0  # มีแค่ MIXED ทั้งตลาด
+    assert len(roadmap_df(rm)) == 3
+
+
+def test_buy_score_bounds():
+    from ai import enforce_buy_score
+    assert enforce_buy_score(95, 50) == 65 and enforce_buy_score(5, 50) == 35
+    assert enforce_buy_score(None, 42) == 42 and enforce_buy_score(55, 50) == 55
+
+
+def test_decision_plan_export_and_evaluate(fake_md):
+    from pipeline import (RunConfig, analysis_export_df, decision_table, evaluate_exports, run_pipeline,
+                          trade_plan_table)
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False, horizon=30))
+    for c in res["coins"]:
+        assert 0 <= c["buy_sys"] <= 100 and c["buy_final"] == c["buy_sys"] and c["buy_ai"] is None
+        assert c["p_up_h"] is None or 0 <= c["p_up_h"] <= 1
+    assert len(decision_table(res["coins"], {}, 30)) == 2
+    tp = trade_plan_table(res["coins"], res["ts"])
+    assert len(tp) == 2 and {"🛑 Stop Loss", "✅ TP1 ขาย 50%", "ทำอะไร"} <= set(tp.columns)
+    ex = analysis_export_df(res, 30)
+    assert len(ex) == 2 and {"entry_hi", "sl", "tp1", "buy_final", "p_up_h", "tech_pos"} <= set(ex.columns)
+    # ย้อนเวลาวิเคราะห์ไปกลางข้อมูลจำลอง แล้วตรวจกับราคาหลังจากนั้น
+    d = fake_md.ohlcv("ETHUSDT", "1d")
+    t0 = d.index[-200]
+    ex["run_ts_utc"] = (t0 + pd.Timedelta(hours=23, minutes=59, seconds=59)).isoformat()
+    ex["price"] = [float(fake_md.ohlcv(f"{t}USDT", "1d")["close"].loc[t0]) for t in ex["ticker"]]
+    ex["entry_hi"], ex["sl"], ex["tp1"] = ex["price"] * 1.01, ex["price"] * 0.9, ex["price"] * 1.1
+    ex["fill_days"], ex["time_stop_days"] = 5, 30
+    out = evaluate_exports(ex, fake_md, now=pd.Timestamp("2026-11-07", tz="UTC"))
+    assert set(out["table"]["outcome"]) <= {"✅ WIN", "❌ LOSS", "✅ WIN (time stop)", "❌ LOSS (time stop)"}
+    assert out["summary"]["closed"] == 2 and out["summary"]["n_h"] == 2
