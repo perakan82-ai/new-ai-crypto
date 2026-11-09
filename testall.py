@@ -712,3 +712,47 @@ def test_phase_downtrend_and_selling_pressure():
     assert any(e["sign"] < 0 for e in ev)
     phase, _ = market_phase(c, ev)
     assert "ขาลง" in phase or "Capitulation" in phase
+
+
+# ───────────── v6.3: โมเดล AI อัตโนมัติ · แจ้งเตือน AI ล้ม · ปรับเทียบตามสภาพ BTC ─────────────
+def test_model_discovery_and_chain():
+    import ai
+
+    class M:
+        def __init__(self, n, acts=("generateContent",)):
+            self.name, self.supported_actions = f"models/{n}", list(acts)
+
+    class C:
+        class models:  # noqa: N801
+            @staticmethod
+            def list():
+                return [M("gemini-2.5-flash"), M("gemini-3.8-flash"), M("gemini-3.8-pro"), M("gemini-3.5-flash-lite"),
+                        M("gemini-3.9-flash-preview"), M("gemini-3.8-flash-image"), M("text-embedding-004"),
+                        M("gemini-3.8-flash-tts"), M("gemini-x", acts=("embedContent",))]
+    found = ai.discover_models(C())
+    assert found[:3] == ["gemini-3.9-flash-preview", "gemini-3.8-flash", "gemini-3.8-pro"] or found[0] == "gemini-3.9-flash-preview"
+    assert not any(x in " ".join(found) for x in ("image", "embedding", "tts", "gemini-x"))
+    ai._DISCOVERED[:] = found
+    ch = ai.model_chain(ai.AUTO_MODEL)
+    assert ch[0] == found[0] and "gemini-flash-latest" in ch and ai.AUTO_MODEL not in ch
+    assert ai.model_chain("gemini-pro-latest")[0] == "gemini-pro-latest"
+    ai._DISCOVERED.clear()
+
+
+def test_ai_problem_banner(app_mod):
+    app_mod, _ = app_mod
+    res = {"ai_on": True, "port": {"strategist": None, "errors": ["m:schema: 404 NOT_FOUND model no longer available"]},
+           "deep": {"errors": []}, "research": {"log": []}}
+    assert "โมเดล" in app_mod.ai_problem(res)
+    res["port"]["errors"] = ["429 RESOURCE_EXHAUSTED quota"]
+    assert "โควต้า" in app_mod.ai_problem(res)
+    assert app_mod.ai_problem({"ai_on": False}) is None
+
+
+def test_score_check_macro_condition(daily):
+    from deep import score_check
+    d = indicators.add_indicators(daily)
+    mac = np.where(np.arange(len(d)) % 200 < 100, "UP", "DOWN").astype(object)
+    ck = score_check(d, 30, macro=mac)
+    assert ck["macro_up"] is not None and ck["macro_up"]["state"] == mac[-1]
+    assert 0 <= ck["p_today"] <= 1
