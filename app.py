@@ -17,6 +17,8 @@ Secrets (Streamlit Cloud → App settings → Secrets):
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -24,12 +26,14 @@ import streamlit as st
 import sources as na
 from ai import make_client
 from analysis import cap_for
-from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MODEL_FALLBACK, QUOTE, REG_TH, __version__, fp, fpct,
-                    fprob)
+from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
+                    SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, __version__, fp, fpct, fprob)
 from market import MarketData
-from pipeline import (PF_ACT, PF_SEV, PF_SLOTS, RunConfig, deep_dive_md, forecast_md, full_report_md, holding_md,
-                      opportunity_rank, rule_verdict, run_pipeline, run_portfolio, size_long, size_medium,
-                      summary_text, table_backtest, table_forecast, table_long, table_medium, table_patterns)
+from pipeline import (DIR_EMO, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
+                      evaluate_exports, forecast_md, full_report_md, holding_md, horizon_bucket, opportunity_rank,
+                      roadmap_df, rule_verdict, run_pipeline, run_portfolio, size_long, size_medium, summary_text,
+                      table_backtest, table_forecast, table_long, table_market_picks, table_medium, table_patterns,
+                      trade_plan_table)
 
 try:
     import plotly.graph_objects as go
@@ -195,11 +199,36 @@ def render_picks(res: dict, horizon: int, capital: float, risk_pct: float):
     so, ro = port["strategist"], port["risk"]
     if so:
         st.info(f"**🧠 มุมมองตลาด:** {so.market_view}\n\n{so.summary}")
+    st.markdown(f"#### 🧭 สรุปการตัดสินใจ: ควรซื้อไหม · โอกาสขึ้น · เทคนิคไหนบวก/ลบ")
+    st.dataframe(decision_table(coins, port.get("views") or {}, horizon), use_container_width=True, hide_index=True)
+    st.caption("คะแนนควรซื้อ (AI) = ความเห็น AI จากข้อมูลทั้งหมด แต่ระบบจำกัดให้ห่างคะแนนระบบไม่เกิน ±15 · "
+               "คะแนนระบบ = เทคนิคเห็นตรงกัน 35% + โอกาสขึ้น 35% + สถานะจุดเข้า 15% + ข่าว/อีเวนต์ 15% · "
+               "โอกาสขึ้น = สถิติย้อนหลังของเหรียญนั้นในสภาพตลาดคล้ายวันนี้ ไม่ใช่การรับประกัน")
+    st.markdown("#### 🤖 เหรียญที่ AI คัดจากตลาดตอนนี้")
+    sc = res.get("scan") or {}
+    mp = table_market_picks(coins)
+    if len(mp):
+        st.caption(f"สแกน {sc.get('universe', 0)} เหรียญ Volume สูง · ตัด spread กว้าง {sc.get('dropped_spread', 0)} เหรียญ · "
+                   "จัดอันดับด้วย Momentum ปรับความผันผวนเทียบตลาด + Trend (Donchian 5 lookback) + สัญญาณเทคนิค/รูปแบบกราฟ")
+        st.dataframe(mp, use_container_width=True, hide_index=True)
+        bt = sc.get("xs_bt") or {}
+        if bt.get("excess") is not None:
+            k = st.columns(4)
+            k[0].metric(f"Top-{XS_TOP} vs ตลาด / {XS_HOLD} วัน", fpct(bt["excess"], 2))
+            k[1].metric("ชนะตลาด", fprob(bt["hit"]), f"{bt['n']} รอบ")
+            k[2].metric("Out-of-sample", fpct(bt["oos_excess"], 2) if bt.get("oos_excess") is not None else "-")
+            k[3].metric("t-stat", f"{bt['t_stat']:.2f}")
+            st.caption(f"{bt['verdict']} · Backtest ตั้งแต่ {bt['start']} หักค่าธรรมเนียม+slippage แล้ว · "
+                       "⚠️ ใช้รายชื่อเหรียญ Volume สูงของวันนี้ (survivorship bias) ผลจริงอาจแย่กว่านี้")
+        elif bt:
+            st.caption(f"Backtest การจัดอันดับ: {bt.get('verdict')}")
+    else:
+        st.caption("ปิด Scanner อยู่ (เลื่อน 'ให้ AI คัดเหรียญจากตลาด' ใน Sidebar)")
     st.markdown(f"#### 🔥 เหรียญที่มีโอกาสขึ้นใน {horizon} วัน (เรียงตามคะแนนโอกาส)")
     st.caption("⭐ = Scanner คัดจากตลาด (Volume สูง + สัญญาณเทคนิค/รูปแบบกราฟ) · ไม่มีดาว = Watchlist ของคุณ")
     st.dataframe(opportunity_rank(coins, horizon, research), use_container_width=True, hide_index=True)
-    st.caption("คะแนนโอกาส = โอกาสปิดสูงกว่าวันนี้ 40% + upside เทียบจุดย่อ 25% + สถานะจุดเข้า 15% + รูปแบบกราฟ 10% + "
-               "ข่าว/อีเวนต์ 10% · โอกาสมาจากสถิติย้อนหลังของเหรียญนั้น ไม่รับประกันอนาคต")
+    st.caption("คะแนนโอกาส = โอกาสปิดสูงกว่าวันนี้ 35% + upside เทียบจุดย่อ 20% + สถานะจุดเข้า 15% + รูปแบบกราฟ 10% + "
+               "ข่าว/อีเวนต์ 10% + Momentum/Trend 10% · โอกาสมาจากสถิติย้อนหลังของเหรียญนั้น ไม่รับประกันอนาคต")
     st.markdown("#### 🧭 AI คัดเข้าพอร์ต")
     if ro:
         {"APPROVE": st.success, "CAUTION": st.warning, "REJECT": st.error}[ro.verdict](
@@ -234,6 +263,10 @@ def render_picks(res: dict, horizon: int, capital: float, risk_pct: float):
 def render_entries(res: dict, capital: float, risk_pct: float):
     coins, port, research = res["coins"], res["port"], res["research"]["by_ticker"]
     sigs = res.get("signals") or []
+    st.markdown("#### 📋 แผนเข้า-ออก (ทำอะไร · ที่ราคาไหน · ถึงวันไหน)")
+    st.dataframe(trade_plan_table(coins, res["ts"]), use_container_width=True, hide_index=True)
+    st.caption("ไม้ 1 = Limit ที่ขอบบนโซน · ไม้ 2 = Limit ที่ขอบล่าง · SL ตั้งเป็น Stop (แตะระหว่างวันก็ออก — ตรงกับ Backtest) · "
+               "ถึง TP1 ขาย 50% แล้วเลื่อน SL ไปที่ทุน · ไม่ได้ของภายในวันที่ตั้งรอ = ยกเลิกคำสั่ง")
     st.markdown("#### ✅ จุดเข้าที่ผ่านเกณฑ์คุณภาพทุกข้อ")
     if sigs:
         st.dataframe(pd.DataFrame([{
@@ -305,6 +338,96 @@ def render_news_project(res: dict):
         st.caption(nw.get("error") or "News Agent ปิดอยู่ หรือยังไม่มีข่าว")
 
 
+def render_roadmap(res: dict):
+    rm = res.get("roadmap") or []
+    cal = res.get("macro_cal") or {}
+    st.markdown("#### 🗺 Roadmap ข่าว/อีเวนต์ข้างหน้า ที่จะกระทบราคา")
+    if not rm:
+        st.info("ยังไม่มีข้อมูลอีเวนต์ — ต้องใส่ Gemini API Key และเปิด AI Agents (ค้นด้วย Google Search)")
+        if cal.get("errors"):
+            st.caption("Log: " + " | ".join(cal["errors"][:3]))
+        return
+    if go is not None:
+        ys = list(dict.fromkeys(r["scope"] for r in rm))
+        col = {"POSITIVE": "#16a34a", "NEGATIVE": "#dc2626", "MIXED": "#9ca3af"}
+        size = {"HIGH": 22, "MEDIUM": 15, "LOW": 10}
+        fig = go.Figure()
+        for dname, lab in (("POSITIVE", "บวก +"), ("NEGATIVE", "ลบ −"), ("MIXED", "ไม่แน่นอน ±")):
+            xs = [r for r in rm if (r.get("direction") or "MIXED") == dname]
+            if not xs:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[r["dt"] for r in xs], y=[r["scope"] for r in xs], mode="markers", name=lab,
+                marker=dict(color=col[dname], size=[size.get(r.get("impact"), 10) for r in xs],
+                            symbol=["circle" if r.get("certainty") == "CONFIRMED" else "circle-open" for r in xs],
+                            line=dict(width=2, color=col[dname])),
+                text=[f"{r.get('title')}<br>{r.get('impact')} · {r.get('certainty')}<br>{r.get('why') or ''}" for r in xs],
+                hovertemplate="%{x|%d %b %Y}<br>%{text}<extra></extra>"))
+        today = pd.Timestamp.now(tz="Asia/Bangkok").tz_localize(None).normalize()
+        fig.add_vline(x=today, line_dash="dot", line_color="#38bdf8")
+        fig.update_layout(height=max(280, 46 * len(ys) + 120), template="plotly_dark", margin=dict(l=8, r=8, t=30, b=8),
+                          yaxis=dict(categoryorder="array", categoryarray=ys[::-1]), legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("วงกลมทึบ = ยืนยันแล้ว · วงกลมโปร่ง = คาดการณ์/ข่าวลือ · ขนาด = ผลกระทบ · เส้นฟ้า = วันนี้")
+    st.dataframe(roadmap_df(rm), use_container_width=True, hide_index=True,
+                 column_config={"ที่มา": st.column_config.LinkColumn()})
+    st.caption("ผลที่คาด (+/−) เป็นการประเมินของ AI จากข่าวที่ค้นเจอ · ⚠️ ไม่มีลิงก์ = ควรตรวจสอบเองก่อนใช้ · "
+               "อีเวนต์ที่ขึ้นกับผลประกาศ (เช่น FOMC, CPI) ดูคอลัมน์เหตุผลว่าผลแบบไหนเป็นบวก/ลบ")
+    st.markdown("**ผลรวมข่าวข้างหน้ารายเหรียญ** (−1 ลบมาก … +1 บวกมาก)")
+    st.dataframe(pd.DataFrame([{"เหรียญ": c["ticker"], "ข่าวข้างหน้า": f"{c.get('event_net', 0):+.2f}",
+                                "อีเวนต์ของเหรียญนี้": sum(c["ticker"] in r["coins"] for r in rm)}
+                               for c in res["coins"]]), use_container_width=True, hide_index=True)
+
+
+def render_export(res: dict, horizon: int):
+    st.markdown("#### 💾 ดาวน์โหลดผลวิเคราะห์ (เก็บไว้ทำ Backtest / Forward test)")
+    ex = analysis_export_df(res, horizon)
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ ผลวิเคราะห์วันนี้ (.csv)", ex.to_csv(index=False).encode("utf-8-sig"),
+                       f"analysis_{res['ts']:%Y%m%d_%H%M}.csv", "text/csv", use_container_width=True)
+    full = {"run": ex.to_dict(orient="records"),
+            "roadmap": roadmap_df(res.get("roadmap") or []).to_dict(orient="records"),
+            "signals": [s.model_dump(mode="json") for s in res.get("signals") or []],
+            "macro": {k: res["macro"].get(k) for k in ("regime", "notes", "btc_price")}}
+    c2.download_button("⬇️ แบบละเอียด (.json)", json.dumps(full, ensure_ascii=False, default=str, indent=1),
+                       f"analysis_{res['ts']:%Y%m%d_%H%M}.json", "application/json", use_container_width=True)
+    st.caption(f"1 แถว/เหรียญ: จุดเข้า SL TP คะแนนควรซื้อ โอกาสขึ้น เทคนิคบวก/ลบ ข่าวข้างหน้า ฯลฯ ({len(ex.columns)} คอลัมน์) · "
+               "ดาวน์โหลดทุกครั้งที่วิเคราะห์ แล้วอัปโหลดกลับมาด้านล่างเพื่อตรวจกับราคาจริง")
+    st.divider()
+    st.markdown("#### 🧪 ตรวจผลไฟล์เก่ากับราคาจริง")
+    files = st.file_uploader("อัปโหลดไฟล์ .csv ที่เคยดาวน์โหลด (เลือกได้หลายไฟล์)", type="csv", accept_multiple_files=True,
+                             key="ev_up")
+    if not files:
+        return
+    try:
+        df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"อ่านไฟล์ไม่ได้: {e}")
+        return
+    need = {"run_ts_utc", "ticker", "price", "entry_hi", "sl", "tp1"}
+    if not need <= set(df.columns):
+        st.error(f"ไฟล์ไม่ใช่รูปแบบของแอปนี้ (ขาดคอลัมน์ {', '.join(sorted(need - set(df.columns)))})")
+        return
+    with st.spinner("ดึงราคาจริงหลังวันที่วิเคราะห์…"):
+        ev = evaluate_exports(df, market())
+    sm = ev["summary"]
+    k = st.columns(5)
+    k[0].metric("แผนที่ปิดแล้ว", sm["closed"], f"จาก {sm['rows']} แถว")
+    k[1].metric("ชนะจริง", fprob(sm["win_rate"]), (f"ประเมินไว้ {fprob(sm['est_tp_first'])}" if sm["est_tp_first"] else None))
+    k[2].metric("R เฉลี่ย", f"{sm['avg_R']:+.2f}R" if sm["avg_R"] is not None else "-")
+    k[3].metric("ขึ้นจริงหลังครบกรอบเวลา", fprob(sm["up_rate"]), f"{sm['n_h']} แถว")
+    k[4].metric("โอกาสขึ้นที่ประเมินไว้", fprob(sm["est_p_up"]))
+    if sm["closed"] >= 10 and sm["win_rate"] is not None and sm["est_tp_first"] and sm["win_rate"] < sm["est_tp_first"] - 0.10:
+        st.error("ชนะจริงต่ำกว่าที่ประเมินเกิน 10 จุด → ลดขนาดไม้ลงครึ่งหนึ่งจนกว่าจะกลับมาใกล้เคียง")
+    if len(sm["buckets"]):
+        st.markdown("**คะแนนควรซื้อสูง ได้ผลดีกว่าจริงไหม?**")
+        st.dataframe(sm["buckets"], use_container_width=True, hide_index=True)
+    st.dataframe(ev["table"][["run_date_th", "ticker", "outcome", "R", "ret_h", "up_h", "p_up_h", "buy_final",
+                              "passed_gate", "entry_hi", "sl", "tp1"]],
+                 use_container_width=True, hide_index=True)
+    st.caption("ใช้แท่ง 1D ที่เปิดหลังเวลาวิเคราะห์ · แท่งเดียวกันโดนทั้ง SL และ TP นับ SL · ตัวอย่างน้อยกว่า 30 ยังสรุปไม่ได้")
+
+
 # ═══════════════════════════ main ═══════════════════════════
 def main():
     st.set_page_config(page_title="Crypto AI Intelligence Lab", page_icon="🧠", layout="wide")
@@ -317,9 +440,12 @@ def main():
         st.header("⚙️ ตั้งค่า")
         gkey = _secret("GEMINI_API_KEY") or st.text_input("Gemini API Key", type="password")
         cgkey = _secret("COINGECKO_DEMO_KEY") or st.text_input("CoinGecko Demo Key (ไม่บังคับ)", type="password")
-        watch_raw = st.text_input("Watchlist (คั่นด้วย ,)", DEFAULT_WATCH)
+        watch_raw = st.text_input(f"เหรียญที่สนใจ (สูงสุด {MAX_WATCH} เหรียญ คั่นด้วย ,)", DEFAULT_WATCH)
+        n_watch = len([w for w in watch_raw.split(",") if w.strip()])
+        if n_watch > MAX_WATCH:
+            st.warning(f"ใส่ {n_watch} เหรียญ → ใช้ {MAX_WATCH} ตัวแรก ที่เหลือให้ AI Scanner ตัดสินจากตลาด")
         hz = st.selectbox("⏳ กรอบเวลาที่สนใจ", list(HORIZONS), index=2)
-        n_extra = st.slider("ให้ Scanner คัดเหรียญจากตลาดเพิ่ม", 0, 10, 5)
+        n_extra = st.slider("🤖 ให้ AI คัดเหรียญจากตลาดเพิ่ม", 0, 10, SCAN_DEFAULT_EXTRA)
         min_qvol = st.number_input("Volume 24h ขั้นต่ำ (ล้าน USDT)", 5, 2000, 20, 5) * 1e6
         st.divider()
         capital = st.number_input("เงินทุน (USDT)", 100.0, 1e9, 10_000.0, 500.0)
@@ -378,6 +504,9 @@ def main():
     final_win = {k: v["win_final"] for k, v in pick_by.items()}
     if res["missing"]:
         st.warning(f"ไม่พบคู่ {QUOTE}: {', '.join(res['missing'])}")
+    if res.get("watch_dropped"):
+        st.caption(f"ไม่ได้วิเคราะห์เป็น Watchlist (เกิน {MAX_WATCH}): {', '.join(res['watch_dropped'])} — "
+                   "ถ้าน่าสนใจจริง AI Scanner จะคัดขึ้นมาเอง")
     if res.get("skipped"):
         st.caption("ข้าม: " + " · ".join(res["skipped"][:6]))
 
@@ -394,8 +523,9 @@ def main():
         st.markdown("\n".join(f"- {n}" for n in macro["notes"]))
         st.caption(f"Data: {res['host']} · AI: {port['mode']} · ใช้เวลา {res['elapsed']:.1f}s · {res['ts']:%d/%m %H:%M}")
 
-    tabs = st.tabs(["🔥 AI คัดเหรียญ", "🎯 จุดเข้า Spot", "💼 พอร์ตของฉัน", "🔮 Price Prediction", "📐 รูปแบบกราฟ",
-                    "📰 ข่าว & โปรเจกต์", "⏱ ระยะกลาง", "🏦 ระยะยาว", "⚠️ Risk & Backtest", "📄 รายงาน"])
+    tabs = st.tabs(["🔥 AI คัดเหรียญ", "🎯 จุดเข้า-ออก", "💼 พอร์ตของฉัน", "🔮 Price Prediction", "📐 รูปแบบกราฟ",
+                    "📰 ข่าว & โปรเจกต์", "⏱ ระยะกลาง", "🏦 ระยะยาว", "⚠️ Risk & Backtest", "📄 รายงาน",
+                    "🗺 Roadmap ข่าว", "💾 ดาวน์โหลด & ตรวจผล"])
     with tabs[0]:
         render_picks(res, horizon, capital, risk_pct)
     with tabs[1]:
@@ -443,6 +573,10 @@ def main():
                                 _md_table)
         st.download_button("⬇️ ดาวน์โหลดรายงานเต็ม (.md)", report, f"crypto_report_{res['ts']:%Y%m%d_%H%M}.md",
                            "text/markdown")
+    with tabs[10]:
+        render_roadmap(res)
+    with tabs[11]:
+        render_export(res, horizon)
 
     st.caption("⚠️ เพื่อการศึกษา ไม่ใช่คำแนะนำการลงทุน · ความน่าจะเป็นมาจากสถิติย้อนหลัง ไม่รับประกันอนาคต")
 
