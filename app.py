@@ -27,10 +27,10 @@ import sources as na
 from ai import make_client
 from analysis import cap_for
 from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
-                    SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, __version__, fp, fpct, fprob)
+                    SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, __version__, dist, fbig, fp, fpct, fprob)
 from market import MarketData
 from deep import check_table, horizon_table, mtf_table, peer_table, signals_table, strategy_table
-from pipeline import (DIR_EMO, final_verdict, outlook_label, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
+from pipeline import (DIR_EMO, downside_plan, final_verdict, outlook_label, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
                       evaluate_exports, forecast_md, full_report_md, holding_md, horizon_bucket, opportunity_rank,
                       roadmap_df, rule_verdict, run_pipeline, run_portfolio, size_long, size_medium, summary_text,
                       table_backtest, table_forecast, table_long, table_market_picks, table_medium, table_patterns,
@@ -205,6 +205,15 @@ def render_picks(res: dict, horizon: int, capital: float, risk_pct: float):
     st.caption("คะแนนควรซื้อ (AI) = ความเห็น AI จากข้อมูลทั้งหมด แต่ระบบจำกัดให้ห่างคะแนนระบบไม่เกิน ±15 · "
                "คะแนนระบบ = เทคนิคเห็นตรงกัน 35% + โอกาสขึ้น 35% + สถานะจุดเข้า 15% + ข่าว/อีเวนต์ 15% · "
                "โอกาสขึ้น = สถิติย้อนหลังของเหรียญนั้นในสภาพตลาดคล้ายวันนี้ ไม่ใช่การรับประกัน")
+    st.markdown("#### 🧠 อ่านสถานการณ์รายเหรียญ — ทำไมแนะนำ / ทำไมยังไม่แนะนำ")
+    st.caption("เรียงจากคะแนนสูงสุด · แม้อันดับ 1 ก็อาจยังไม่ควรซื้อ ถ้ามีแรงขายหรือมีโอกาสย่อลึก")
+    ranked = sorted([c for c in coins if c.get("read")], key=lambda c: -c.get("buy_final", 0))
+    for i, c in enumerate(ranked):
+        rd = c["read"]
+        icon = "✅" if rd["verdict"]["recommend"] else "❌"
+        with st.expander(f"{i + 1}. {icon} {'⭐' if c.get('is_pick') else ''}{c['ticker']} {fp(c['price'])} · "
+                         f"{c.get('buy_final', 0):.0f}/100 · {rd['phase']}", expanded=(i == 0)):
+            render_read(c)
     st.markdown("#### 🤖 เหรียญที่ AI คัดจากตลาดตอนนี้")
     sc = res.get("scan") or {}
     mp = table_market_picks(coins)
@@ -382,7 +391,7 @@ def render_project(dp: dict):
     gv = {"HIGH": "🟢 สูง", "MEDIUM": "🟡 ปานกลาง", "LOW": "🔴 ต่ำ"}.get(pd_["growth_view"], pd_["growth_view"])
     st.markdown(f"#### 🏗 โปรเจกต์ & Roadmap ปีนี้–ปีหน้า · ศักยภาพเติบโต 1-2 ปี: {gv}"
                 + ("" if pj.get("verified") else " ⚠️ ไม่ได้ค้นเว็บ"))
-    st.markdown(f"**{pd_['category']}** — {pd_['summary']}\n\n**เหตุผลศักยภาพเติบโต:** {pd_['growth_reason']}")
+    st.markdown(f"**เหตุผลศักยภาพเติบโต:** {pd_['growth_reason']}")
     items = pd_.get("roadmap") or []
     if items:
         stt = {"DONE": "✅ เสร็จแล้ว", "IN_PROGRESS": "🔧 กำลังทำ", "PLANNED": "🗓 วางแผน", "RUMOR": "💬 ข่าวลือ"}
@@ -399,6 +408,88 @@ def render_project(dp: dict):
                 f"**คู่แข่ง:** {', '.join(pd_['competitors']) or '-'}")
     if pj.get("sources"):
         st.caption("แหล่งข้อมูล: " + " · ".join(f"[{x['title'][:40]}]({x['uri']})" for x in pj["sources"][:8]))
+
+
+def render_read(c: dict):
+    """กล่องอ่านสถานการณ์ 1 เหรียญ (ใช้ markdown เพื่อไม่ให้ element ซ้ำกัน)"""
+    rd = c.get("read")
+    if not rd:
+        return
+    (st.success if rd["verdict"]["recommend"] else st.warning)(rd["story"])
+    st.markdown(f"**เหตุการณ์ที่กำลังเกิด: {rd['phase']}** — {rd['phase_why']}")
+    if rd["evidence"]:
+        st.markdown("**หลักฐานแรงซื้อ / แรงขาย**\n" + "\n".join(
+            f"- {'🟢' if e['sign'] > 0 else '🔴'} {e['text']}" for e in rd["evidence"]))
+    dn = rd["downside"]
+    if not rd["verdict"]["recommend"]:
+        sup = " · ".join(f"{fp(x['level'])} ({fprob(x['p'])})" for x in dn["supports"]) or "-"
+        st.markdown(f"| อาจย่อถึง (50%) | ร่วงลึก (30%) | แนวรับ (โอกาสแตะ) | 🟦 โซนพิจารณาซื้อ |\n|---|---|---|---|\n"
+                    f"| {fp(dn['dip50'])} ({dist(c, dn['dip50']) if dn['dip50'] else '-'}) | {fp(dn['dip30'])} | {sup} | "
+                    f"{fp(dn['buy_zone'][0])} – {fp(dn['buy_zone'][1])} ({fprob(dn['buy_zone_p'])}) |")
+        if rd["when"]:
+            st.markdown(f"**⏱ คาดว่าการย่อจะจบเมื่อไหร่:** {rd['when']}")
+        st.markdown("**✅ กลับมาซื้อได้เมื่อ:** " + " · ".join(rd["flip"]))
+    if rd.get("ai_wait"):
+        st.info(f"🧠 **AI:** {rd['ai_wait']}")
+
+
+def render_downside(c: dict, horizon: int):
+    """ยังไม่แนะนำให้ซื้อ → บอกว่าอาจร่วงถึงไหน และราคาไหนถึงควรพิจารณาซื้อ"""
+    dn = downside_plan(c, horizon)
+    st.markdown(f"#### ❌ ยังไม่แนะนำให้ซื้อตอนนี้ — แผนรอซื้อ (กรอบ {dn['H']} วัน)")
+    rows = []
+    if dn["dip50"]:
+        rows.append({"ระดับ": "📉 อาจย่อถึง", "ราคา": fp(dn["dip50"]), "จากราคาตอนนี้": dist(c, dn["dip50"]),
+                     "โอกาสแตะ": "50%", "หมายเหตุ": "สถิติของเหรียญนี้ในสภาพตลาดคล้ายกัน"})
+    if dn["dip30"]:
+        rows.append({"ระดับ": "📉 ถ้าร่วงลึก", "ราคา": fp(dn["dip30"]), "จากราคาตอนนี้": dist(c, dn["dip30"]),
+                     "โอกาสแตะ": "30%", "หมายเหตุ": "กรณีแย่กว่าปกติ"})
+    for x in dn["supports"]:
+        rows.append({"ระดับ": f"🧱 แนวรับ ({x['src']})", "ราคา": fp(x["level"]), "จากราคาตอนนี้": dist(c, x["level"]),
+                     "โอกาสแตะ": fprob(x["p"]), "หมายเหตุ": f"ความแข็งแรง {x['strength']:.0f}"})
+    z = dn["buy_zone"]
+    rows.append({"ระดับ": "🟦 โซนพิจารณาซื้อ", "ราคา": f"{fp(z[0])} – {fp(z[1])}", "จากราคาตอนนี้": dist(c, z[1]),
+                 "โอกาสแตะ": fprob(dn["buy_zone_p"]), "หมายเหตุ": dn["buy_zone_why"]})
+    rows.append({"ระดับ": "🛑 ถ้าหลุด (Weekly ปิดต่ำกว่า)", "ราคา": fp(dn["long_stop"]), "จากราคาตอนนี้": dist(c, dn["long_stop"]),
+                 "โอกาสแตะ": "-", "หมายเหตุ": "โครงสร้างระยะยาวเสีย ไม่ควรถัว"})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.markdown("**✅ จะเปลี่ยนเป็นน่าซื้อเมื่อ:**\n" + "\n".join(f"- {x}" for x in dn["flip"]))
+    st.caption("ถึงราคาจะลงมาถึงโซนพิจารณาซื้อ ก็ควรรอสัญญาณกลับตัว (เช่น 4H ยืนเหนือ EMA21) ก่อนเข้า · โอกาสแตะมาจากสถิติ ไม่รับประกัน")
+
+
+def render_fundamentals(dp: dict, c: dict, compact: bool = False):
+    """ข้อมูลพื้นฐาน: ทำอะไร · ใช้งาน · ทีม · ระดมทุน · นายทุนใหญ่ · ศักยภาพเติบโต"""
+    pd_ = ((dp.get("project") or {}).get("data")) or {}
+    f = c.get("fund") or {}
+    st.markdown(f"#### 🏛 ข้อมูลพื้นฐาน {f.get('name') or c['ticker']}")
+    base = (f"Rank #{f.get('rank', '-')} · MCap {fbig(f.get('mcap'))} · FDV/MCap "
+            f"{f['fdv_mcap']:.2f}" if f.get("fdv_mcap") else f"Rank #{f.get('rank', '-')} · MCap {fbig(f.get('mcap'))}")
+    if not pd_:
+        st.caption(base + (" · หมวด: " + ", ".join(f.get("categories") or []) if f.get("categories") else "")
+                   + " — ใส่ Gemini API Key เพื่อให้ AI ค้นข้อมูลโปรเจกต์ ทีม และนายทุน")
+        return
+    gv = {"HIGH": "🟢 สูง", "MEDIUM": "🟡 ปานกลาง", "LOW": "🔴 ต่ำ"}.get(pd_.get("growth_view"), "-")
+    st.markdown(f"**{pd_.get('category', '')}** — {pd_.get('summary', '')}")
+    meta = [x for x in (f"ก่อตั้ง {pd_['founded']}" if pd_.get("founded") else "", f"ทีม: {pd_['team']}" if pd_.get("team") else "",
+                        f"ระดมทุน: {pd_['funding']}" if pd_.get("funding") else "", base) if x]
+    st.caption(" · ".join(meta))
+    bk = pd_.get("backers") or []
+    kind = {"VC": "💼 VC", "INSTITUTION": "🏦 สถาบัน", "ETF": "📈 ETF", "TREASURY_COMPANY": "🏢 บริษัทถือเหรียญ",
+            "EXCHANGE": "🔁 Exchange", "FOUNDATION": "🏛 มูลนิธิ", "STRATEGIC": "🤝 พันธมิตร", "OTHER": "•"}
+    if compact:
+        if bk:
+            st.markdown("**นายทุนใหญ่:** " + " · ".join(f"{kind.get(b['kind'], '•')} {b['name']}" for b in bk[:8]))
+        st.markdown(f"**ศักยภาพเติบโต 1-2 ปี:** {gv} — {pd_.get('growth_reason', '')}")
+        return
+    if pd_.get("use_cases") or pd_.get("token_utility"):
+        st.markdown("**ใช้ทำอะไร:** " + " · ".join(pd_.get("use_cases") or []) +
+                    (f"\n\n**เหรียญใช้ทำอะไร:** {pd_['token_utility']}" if pd_.get("token_utility") else ""))
+    if bk:
+        st.dataframe(pd.DataFrame([{"นายทุน": b["name"], "ประเภท": kind.get(b["kind"], b["kind"]), "รายละเอียด": b["detail"],
+                                    "ที่มา": b["source_url"] if str(b["source_url"]).startswith("http") else "⚠️ ไม่มีลิงก์"}
+                                   for b in bk]), use_container_width=True, hide_index=True,
+                     column_config={"ที่มา": st.column_config.LinkColumn()})
+        st.caption("การมีนายทุนใหญ่ไม่ได้รับประกันราคา — บางครั้ง VC คือคนที่รอขายเมื่อ token unlock (ดู Tokenomics ด้านล่าง)")
 
 
 def render_signals_only(dp: dict):
@@ -434,12 +525,25 @@ def render_home(res: dict, capital: float, risk_pct: float):
     if ai.get("thesis"):
         st.info(f"🧠 **AI สรุป:** {ai['thesis']}")
     st.markdown("**ทำไม**\n" + "\n".join(f"- {r}" for r in v["reasons"]))
-    if not v["action"].startswith("⛔"):
+    rd = c.get("read")
+    if rd:
+        st.markdown(f"**เหตุการณ์ที่กำลังเกิด: {rd['phase']}** — {rd['phase_why']}")
+        if rd["evidence"]:
+            st.markdown("**หลักฐานแรงซื้อ / แรงขาย**\n" + "\n".join(
+                f"- {'🟢' if e['sign'] > 0 else '🔴'} {e['text']}" for e in rd["evidence"]))
+    if not v["recommend"]:
+        render_downside(c, res.get("horizon", 30))
+        if rd and rd["when"]:
+            st.markdown(f"**⏱ คาดว่าการย่อจะจบเมื่อไหร่:** {rd['when']}")
+        if rd and rd.get("ai_wait"):
+            st.info(f"🧠 **AI:** {rd['ai_wait']}")
+    else:
         sz = size_medium(c, capital, risk_pct, None)
         st.markdown(f"**ขนาดไม้ที่แนะนำ:** {sz['qty']:.4g} {focus} ≈ ${sz['notional']:,.0f} · ถ้าโดน SL เสีย "
                     f"${sz['loss']:,.0f} ({sz['loss_pct']:.2f}% ของทุน)")
     if v["accuracy"]:
         st.caption("🧪 " + v["accuracy"])
+    render_fundamentals(dp, c, compact=True)
     if dp.get("data"):
         render_horizons(dp, c, show_signals=False)
     st.markdown("#### 📋 แผนเข้า-ออก")
@@ -512,6 +616,7 @@ def render_deep(res: dict, capital: float, risk_pct: float):
     else:
         st.caption("ใส่ Gemini API Key + เปิด AI Agents เพื่อให้ AI เขียนบทวิเคราะห์และสถานการณ์ Bull/Base/Bear")
     render_signals_only(dp)
+    render_fundamentals(dp, c)
     render_project(dp)
     st.markdown("#### ⏱ หลายกรอบเวลา (กรอบใหญ่บอกทิศ · กรอบเล็กบอกจังหวะ)")
     st.markdown(f"**{data['alignment']}**")
