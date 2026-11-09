@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from config import FC_H, FEE, LONG_H, MAJORS, MED_H, MIN_BARS_1D, OOS_FRACTION, QUOTE, SHRINK_K, SLIPPAGE, TIER_W
+from config import (DONCHIAN_LB, FC_H, FEE, LONG_H, MAJORS, MED_H, MIN_BARS_1D, MOM_LB, MR_Z_4H, OOS_FRACTION, QUOTE,
+                    SHRINK_K, SLIPPAGE, TIER_W, XS_HOLD, XS_TOP)
 from market import add_indicators, closed_only
 
 
@@ -475,6 +476,113 @@ def corr_matrix(d1_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 # ════════════════════ macro ════════════════════
+# ───────────────────────── Trend & Momentum (v5.1 จากงานวิจัย) ─────────────────────────
+def donchian_trend(d: pd.DataFrame, lookbacks: tuple[int, ...] = DONCHIAN_LB) -> pd.Series:
+    """คะแนนเทรนด์ 0..1 = สัดส่วนของ Donchian หลาย lookback ที่อยู่ในสถานะถือ (Zarattini et al. 2025)
+
+    แต่ละ lookback L: เข้าเมื่อปิดเหนือ High สูงสุดของ L แท่งก่อนหน้า · ออกเมื่อปิดต่ำกว่า Low ต่ำสุดของ L/2 แท่งก่อนหน้า
+    ใช้ข้อมูลถึงแท่งนั้นเท่านั้น (shift 1) → ไม่มี look-ahead · รวมหลาย lookback เพื่อลดการพึ่งพาพารามิเตอร์เดียว
+    """
+    c = d["close"].to_numpy()
+    n = len(c)
+    states = []
+    for L in lookbacks:
+        if n <= L + 1:
+            continue
+        up = d["high"].rolling(L).max().shift(1).to_numpy()
+        dn = d["low"].rolling(max(L // 2, 5)).min().shift(1).to_numpy()
+        st_, on = np.zeros(n), False
+        for i in range(n):
+            if not on and np.isfinite(up[i]) and c[i] > up[i]:
+                on = True
+            elif on and np.isfinite(dn[i]) and c[i] < dn[i]:
+                on = False
+            st_[i] = on
+        states.append(st_)
+    if not states:
+        return pd.Series(np.nan, index=d.index)
+    return pd.Series(np.mean(states, axis=0), index=d.index)
+
+
+def momentum_profile(d: pd.DataFrame) -> dict:
+    """Momentum ปรับความผันผวน + คะแนนเทรนด์ + order flow ของเหรียญเดียว (ใช้แท่งปิดแล้ว)
+
+    risk_adj = ค่าเฉลี่ยของ log-return L วัน ÷ ความผันผวนในช่วง L วัน (คล้าย t-stat ของเทรนด์)
+    → เหรียญที่ขึ้นแรงเพราะผันผวนสูงจะไม่ได้คะแนนเกินจริง (Grobys et al. 2025: momentum crash แรง)
+    """
+    c = d["close"]
+    lr = np.log(c).diff()
+    vol = float(lr.iloc[-90:].std() * np.sqrt(365)) if len(lr) > 30 else np.nan
+    rets, ra = {}, []
+    for L in MOM_LB:
+        if len(c) > L:
+            r = float(c.iloc[-1] / c.iloc[-L - 1] - 1)
+            rets[L] = r
+            if np.isfinite(vol) and vol > 0:
+                ra.append(np.log1p(r) / (vol * np.sqrt(L / 365)))
+    tr = donchian_trend(d)
+    t_now = float(tr.iloc[-1]) if len(tr) and np.isfinite(tr.iloc[-1]) else None
+    of = None
+    if "taker_ratio7" in d and "taker_ratio30" in d:
+        a, b = d["taker_ratio7"].iloc[-1], d["taker_ratio30"].iloc[-1]
+        if np.isfinite(a) and np.isfinite(b):
+            of = float(a - b)  # > 0 = แรงซื้อเชิงรุก 7 วันมากกว่าค่าเฉลี่ย 30 วัน
+    return {"ret": rets, "vol": vol, "risk_adj": float(np.mean(ra)) if ra else None, "trend": t_now, "orderflow": of}
+
+
+def xs_rank(profiles: dict[str, dict]) -> dict[str, float]:
+    """จัดอันดับ momentum เทียบกันทั้งตลาด → percentile 0..1 (1 = แข็งแรงที่สุด)"""
+    vals = pd.Series({k: v.get("risk_adj") for k, v in profiles.items() if v.get("risk_adj") is not None}, dtype=float)
+    if vals.empty:
+        return {}
+    return vals.rank(pct=True).to_dict()
+
+
+def xs_momentum_backtest(closes: pd.DataFrame, hold: int = XS_HOLD, top: int = XS_TOP,
+                         lookbacks: tuple[int, ...] = MOM_LB) -> dict:
+    """Backtest การจัดอันดับ momentum เทียบตลาด (Spot long-only ไม่มี leverage)
+
+    ทุก `hold` วัน: ใช้ข้อมูลถึงวัน t (ปิดแล้ว) จัดอันดับ → ซื้อ top N ที่ close วัน t+1 ขายที่ close วัน t+1+hold
+    เทียบกับถือทุกเหรียญเท่ากันในช่วงเดียวกัน · หักค่าธรรมเนียม+slippage ไปกลับเฉพาะฝั่งกลยุทธ์ทุกรอบ (conservative)
+    ⚠️ Survivorship bias: ใช้รายชื่อเหรียญ Volume สูงของวันนี้ → ผลในอดีตอาจดีกว่าความจริง
+    """
+    px = closes.sort_index().astype(float)
+    lr = np.log(px).diff()
+    vol = lr.rolling(90, min_periods=30).std() * np.sqrt(365)
+    score = sum(np.log(px / px.shift(L)) / (vol * np.sqrt(L / 365)) for L in lookbacks) / len(lookbacks)
+    n, t, rows = len(px), max(lookbacks) + 30, []
+    while t + 1 + hold < n:
+        s = score.iloc[t].replace([np.inf, -np.inf], np.nan).dropna()
+        fwd = (px.iloc[t + 1 + hold] / px.iloc[t + 1] - 1).reindex(s.index).dropna()
+        s = s.reindex(fwd.index)
+        if len(s) >= top * 2:
+            pick = s.nlargest(top).index
+            rows.append((px.index[t], float(fwd[pick].mean()) - 2 * COST, float(fwd.mean())))
+        t += hold
+    out = {"n": len(rows), "hold": hold, "top": top, "universe": int(px.shape[1])}
+    if len(rows) < 12:
+        out.update(verdict="ข้อมูลไม่พอสำหรับทดสอบ", excess=None, hit=None, oos_excess=None, t_stat=None,
+                   cum_top=None, cum_all=None, start=None)
+        return out
+    r_top = np.array([r[1] for r in rows])
+    r_all = np.array([r[2] for r in rows])
+    ex = r_top - r_all
+    split = int(len(ex) * (1 - OOS_FRACTION))
+    sd = ex.std(ddof=1)
+    t_stat = float(ex.mean() / sd * np.sqrt(len(ex))) if sd > 0 else 0.0
+    oos = float(ex[split:].mean()) if len(ex) - split >= 3 else None
+    if ex.mean() > 0 and t_stat >= 1.5 and (oos or 0) > 0:
+        verdict = "✅ การจัดอันดับมี edge ในช่วงที่ทดสอบ (รวม out-of-sample)"
+    elif ex.mean() > 0:
+        verdict = "🟡 บวกเล็กน้อย แต่ยังไม่มีนัยสำคัญทางสถิติ — ใช้ประกอบ ไม่ใช่เหตุผลหลัก"
+    else:
+        verdict = "🔴 ไม่มี edge ในช่วงนี้ — อย่าใช้อันดับ momentum เป็นเหตุผลหลัก"
+    out.update(verdict=verdict, excess=float(ex.mean()), hit=float((ex > 0).mean()), oos_excess=oos, t_stat=t_stat,
+               cum_top=float(np.prod(1 + r_top) - 1), cum_all=float(np.prod(1 + r_all) - 1),
+               start=str(rows[0][0].date()))
+    return out
+
+
 def macro_agent(btc_d: pd.DataFrame, btc_w: pd.DataFrame, glob: dict, fng: dict | None) -> dict:
     pts, notes = 0, []
     w, d = btc_w.iloc[-1], btc_d.iloc[-1]
@@ -574,10 +682,16 @@ def medium_plan(c: dict, macro: dict) -> dict:
     ft2 = first_touch(c, tp2, sl, min(90, tstop * 2), entry)
     p_fill = 1.0 if price <= zhi else touch_prob(c, zhi, 14)
 
-    trig4h = False
+    trig4h, mr4h, z4 = False, False, None
+    cf = c["cf"]
     if h4 is not None and len(h4) > 30:
         r4 = h4.iloc[-1]
         trig4h = bool(r4.close > r4.ema21 and r4.macd_h > h4["macd_h"].iloc[-2]) or bool(r4.rsi < 40)
+        zv = r4.get("bb_z")
+        z4 = float(zv) if zv is not None and np.isfinite(zv) else None
+        # ย่อในเทรนด์ขาขึ้น: 1D ขาขึ้น (เทรนด์) + 4H ต่ำกว่าค่าเฉลี่ยมาก (mean reversion ระยะสั้น) — Ekström 2025
+        mr4h = cf["regime"] == "UP" and z4 is not None and z4 <= MR_Z_4H
+        trig4h = trig4h or mr4h
     reasons = []
     rw = rel_win(ft1)
     edge = rw is not None and rw > be_win
@@ -587,6 +701,8 @@ def medium_plan(c: dict, macro: dict) -> dict:
     elif price <= zhi + 0.3 * atr_ and trig4h and bt["expectancy"] >= 0 and edge:
         status = "🟢"
         reasons.append("ราคาอยู่ในโซนแนวรับ + 4H กลับตัว + สถิติได้เปรียบ")
+        if mr4h:
+            reasons.append(f"ย่อในเทรนด์ขาขึ้น: 4H ต่ำกว่าเส้นกลาง Bollinger {z4:.1f} SD")
     else:
         status = "🟡"
         if price > zhi + 0.3 * atr_:
@@ -613,7 +729,8 @@ def medium_plan(c: dict, macro: dict) -> dict:
     return {"status": status, "reasons": reasons, "zone": (zlo, zhi), "entry": entry, "sl": sl,
             "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": (tp2 - entry) / R, "risk_pct": sl_pct,
             "be_win": be_win * 100, "win_sys": float(np.clip(win_sys, 5, 95)), "hold": fmt_days(a, b), "tstop": tstop,
-            "ft1": ft1, "ft2": ft2, "p_fill": p_fill, "support": S, "trig4h": trig4h, "rel_win": rw}
+            "ft1": ft1, "ft2": ft2, "p_fill": p_fill, "support": S, "trig4h": trig4h, "rel_win": rw,
+            "mr4h": mr4h, "z4h": z4}
 
 
 def long_plan(c: dict) -> dict:
@@ -680,7 +797,75 @@ def quant_score(c: dict) -> float:
     s += 8 * float(np.clip(c["bt"]["expectancy"], -1, 1))
     s += float(np.clip((r["rs90"] if not np.isnan(r["rs90"]) else 0) * 30, -8, 8))
     s += pattern_points(c.get("patterns", []))
+    tr = (c.get("mom") or {}).get("trend")
+    if tr is not None:  # ±6: Trend ensemble (Donchian หลาย lookback)
+        s += 12 * (tr - 0.5)
     return float(np.clip(s, 0, 100))
+
+
+def technical_votes(c: dict) -> dict:
+    """แยกทีละเทคนิคว่า 'บวก / ลบ / กลาง' พร้อมเหตุผลเป็นตัวเลข (ใช้แท่งปิดแล้วเท่านั้น)
+
+    tech_score 0-100 = 50 + 50 × (บวก − ลบ) / จำนวนเทคนิค → "ความเห็นตรงกันของเทคนิค" ไม่ใช่ความน่าจะเป็น
+    """
+    d, m, l, bt = c["d1"], c["med"], c["long"], c["bt"]
+    x, p = d.iloc[-1], d.iloc[-2]
+    mo = c.get("mom") or {}
+    v: list[dict] = []
+
+    def add(name: str, vote: int, detail: str):
+        v.append({"name": name, "vote": int(vote), "detail": detail})
+
+    reg = c["cf"]["regime"]
+    add("แนวโน้ม EMA (1D)", {"UP": 1, "DOWN": -1}.get(reg, 0),
+        f"ราคา {'เหนือ' if x.close > (x.ema200 if np.isfinite(x.ema200) else x.ema50) else 'ใต้'} EMA200/50 · {REG_TXT[reg]}")
+    sd = c["struct_d"]["code"]
+    add("โครงสร้างราคา HH/HL", {"UP": 1, "DOWN": -1}.get(sd, 0), c["struct_d"]["label"] + (f" · {c['struct_d']['bos']}" if c["struct_d"].get("bos") else ""))
+    add("แนวโน้มรายสัปดาห์", 1 if l["w_up"] else (-1 if l["w_down"] else 0),
+        "Weekly เหนือ EMA21/50" if l["w_up"] else ("Weekly ใต้ EMA21/50" if l["w_down"] else "Weekly ยังไม่ชัด"))
+    tr = mo.get("trend")
+    if tr is not None:
+        add("Trend ensemble (Donchian)", 1 if tr >= 0.6 else (-1 if tr <= 0.2 else 0), f"{tr * 5:.0f}/5 lookback อยู่ในเทรนด์")
+    xs = c.get("xs_pct")
+    if xs is not None:
+        add("Momentum เทียบตลาด", 1 if xs >= 0.7 else (-1 if xs <= 0.3 else 0), f"แข็งกว่า {xs * 100:.0f}% ของตลาด")
+    rsi = float(x.rsi)
+    add("RSI 14", 1 if 52 <= rsi <= 72 else (-1 if rsi > 78 or rsi < 42 else 0),
+        f"RSI {rsi:.0f}" + (" (ร้อนแรงเกิน)" if rsi > 78 else " (อ่อนแรง)" if rsi < 42 else ""))
+    mh, mh0 = float(x.macd_h), float(p.macd_h)
+    add("MACD", 1 if mh > 0 and mh >= mh0 else (-1 if mh < 0 and mh <= mh0 else 0),
+        f"Histogram {'บวก' if mh > 0 else 'ลบ'} · {'เพิ่มขึ้น' if mh >= mh0 else 'ลดลง'}")
+    adx = float(x.adx) if np.isfinite(x.adx) else 0.0
+    add("ADX / DI", (1 if x.pdi > x.mdi else -1) if adx >= 20 else 0,
+        f"ADX {adx:.0f} · {'+DI > -DI' if x.pdi > x.mdi else '-DI > +DI'}" + (" (ไม่มีเทรนด์ชัด)" if adx < 20 else ""))
+    z = float(x.bb_z) if "bb_z" in d and np.isfinite(x.bb_z) else 0.0
+    add("Bollinger (1D)", -1 if z > 2.2 else (1 if z < -1.5 and reg == "UP" else 0),
+        f"Z {z:+.1f} SD" + (" ยืดเกินเส้นบน เสี่ยงย่อ" if z > 2.2 else " ย่อลึกในขาขึ้น" if z < -1.5 and reg == "UP" else ""))
+    obv_up = d["obv"].iloc[-1] > d["obv"].iloc[-21]
+    vr = float(x.vol_ratio) if np.isfinite(x.vol_ratio) else 1.0
+    add("Volume / OBV", 1 if obv_up and x.close > x.ema20 else (-1 if not obv_up and x.close < x.ema20 else 0),
+        f"OBV 20D {'สะสม' if obv_up else 'แจกจ่าย'} · Vol {vr:.1f}x")
+    of = mo.get("orderflow")
+    if of is not None:
+        add("Order flow (taker buy)", 1 if of > 0.02 else (-1 if of < -0.02 else 0), f"แรงซื้อเชิงรุก 7D vs 30D {of * 100:+.1f}%")
+    pats = c.get("patterns", [])
+    pb = sum(q["bias"] == "bull" for q in pats) - sum(q["bias"] == "bear" for q in pats)
+    add("รูปแบบกราฟ", int(np.sign(pb)), " · ".join(f"{q['name']}" for q in pats) or "ไม่พบรูปแบบเด่น")
+    add("จังหวะ 4H", 1 if m["trig4h"] else 0,
+        "ย่อในเทรนด์ขาขึ้น (mean reversion)" if m.get("mr4h") else ("4H กลับตัวขึ้น" if m["trig4h"] else "4H ยังไม่ยืนยัน"))
+    add("Backtest แผนนี้", 1 if bt["n"] >= 5 and bt["expectancy"] > 0 and bt["oos_expectancy"] >= 0 else
+        (-1 if bt["n"] >= 5 and bt["expectancy"] < 0 else 0), f"{bt['n']} ไม้ · {bt['expectancy']:+.2f}R · OOS {bt['oos_expectancy']:+.2f}R")
+    rw = m.get("rel_win")
+    if rw is not None:
+        e = rw * 100 - m["be_win"]
+        add("สถิติ TP ก่อน SL", 1 if e >= 3 else (-1 if e < 0 else 0), f"{rw * 100:.0f}% vs คุ้มทุน {m['be_win']:.0f}%")
+    bull = sum(t["vote"] > 0 for t in v)
+    bear = sum(t["vote"] < 0 for t in v)
+    score = 50 + 50 * (bull - bear) / max(len(v), 1)
+    return {"votes": v, "bull": bull, "bear": bear, "neutral": len(v) - bull - bear, "score": float(np.clip(score, 0, 100))}
+
+
+REG_TXT = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่าน", "DOWN": "ขาลง"}
 
 
 def analyze_coin(sym: str, fr: dict, btc_d: pd.DataFrame, macro: dict, fund: dict,
@@ -702,7 +887,7 @@ def analyze_coin(sym: str, fr: dict, btc_d: pd.DataFrame, macro: dict, fund: dic
          "struct_w": market_structure(w1, 3, 156) if w1 is not None and len(w1) > 20 else
          {"code": "NA", "label": "ข้อมูลไม่พอ", "bos": ""},
          "cf": conditional_forward(d1), "risk": risk_metrics(d1, btc_d), "pattern": candle_pattern(d1),
-         "fund": fund, "last_closed": d1.index[-1]}
+         "fund": fund, "last_closed": d1.index[-1], "mom": momentum_profile(d1)}
     c["med"] = medium_plan(c, macro)
     c["long"] = long_plan(c)
     c["fc"] = forecast_table(c)
@@ -710,5 +895,6 @@ def analyze_coin(sym: str, fr: dict, btc_d: pd.DataFrame, macro: dict, fund: dic
     for p in c["patterns"]:
         p["p_target_60"] = touch_prob(c, p["target"], 60)  # โอกาสแตะเป้ารูปแบบใน 60 วัน (สถิติ)
     c["score"] = quant_score(c)
+    c["tech"] = technical_votes(c)  # คำนวณใหม่ใน pipeline หลังได้ Momentum เทียบตลาด
     c.pop("_fc", None)
     return c
