@@ -34,6 +34,24 @@ class Event(BaseModel):
     impact: Literal["HIGH", "MEDIUM", "LOW"]
     certainty: Literal["CONFIRMED", "EXPECTED", "RUMOR"]
     source_url: str
+    direction: Literal["POSITIVE", "NEGATIVE", "MIXED"] = "MIXED"  # คาดว่าผลต่อราคาเป็น + / − / ไม่แน่นอน
+    why: str = ""
+
+
+class MacroEvent(BaseModel):
+    date: str
+    title: str
+    category: Literal["FED", "CPI", "JOBS", "ETF", "REGULATION", "UNLOCK", "UPGRADE", "EXCHANGE", "OTHER"]
+    coins: list[str]          # ว่าง = กระทบทั้งตลาด
+    direction: Literal["POSITIVE", "NEGATIVE", "MIXED"]
+    impact: Literal["HIGH", "MEDIUM", "LOW"]
+    certainty: Literal["CONFIRMED", "EXPECTED", "RUMOR"]
+    why: str
+    source_url: str
+
+
+class MacroCalendar(BaseModel):
+    events: list[MacroEvent]
 
 
 class CoinResearch(BaseModel):
@@ -67,6 +85,9 @@ class CoinView(BaseModel):
     reasons: list[str]
     invalidation: str
     watch: str
+    buy_score: int = 50                       # ความเห็น AI: ควรซื้อแค่ไหน 0-100 (ระบบจำกัดให้ห่างคะแนนระบบ ≤ ±15)
+    outlook: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL"
+    key_techniques: list[str] = []            # เทคนิคหลักที่ทำให้สรุปแบบนี้
 
 
 class StrategistOut(BaseModel):
@@ -218,7 +239,9 @@ def research_agent(client, model: str, coins: list[dict], cache: dict, progress:
 {json.dumps(ctx, ensure_ascii=False)}
 สำหรับแต่ละเหรียญ ให้: project (โปรเจกต์ทำอะไร 1-2 ประโยค), strengths (จุดแข็ง 2-4 ข้อ), tokenomics (supply/inflation/unlock สำคัญ),
 news_30d (ข่าวสำคัญ 30 วันล่าสุดพร้อมวันที่ 3-5 ข้อ), bull_case, bear_case, catalyst_score (-100 ถึง 100 = แรงส่งเชิงข่าว/อีเวนต์ 1-6 เดือน),
-events (อีเวนต์ 6 เดือนข้างหน้า: date เป็น YYYY-MM-DD หรือ YYYY-Qn, type, title, impact, certainty, source_url ต้องเป็นลิงก์จริงที่ค้นเจอ)
+events (อีเวนต์ 6 เดือนข้างหน้า: date เป็น YYYY-MM-DD หรือ YYYY-MM หรือ YYYY-Qn, type, title, impact, certainty,
+source_url ต้องเป็นลิงก์จริงที่ค้นเจอ, direction = POSITIVE/NEGATIVE/MIXED คาดว่าผลต่อราคาเหรียญเป็นบวกหรือลบ
+(เช่น token unlock ใหญ่ = NEGATIVE, mainnet/ETF อนุมัติ = POSITIVE, ผลยังไม่แน่ = MIXED), why = เหตุผล 1 ประโยค)
 กฎ: ใช้ข้อมูลที่ค้นเจอจริงเท่านั้น ห้ามแต่งวันที่/ตัวเลข ถ้าไม่พบให้ใส่ list ว่าง เขียนภาษาไทย (ชื่อเฉพาะอังกฤษได้) ไม่ต้องใส่ราคาเป้าหมาย"""
         out, srcs, mode, errs = gemini_json(client, model, prompt, ResearchBatch, search=True)
         log_.append({"batch": [c["ticker"] for c in batch], "mode": mode, "errors": errs})
@@ -236,6 +259,74 @@ events (อีเวนต์ 6 เดือนข้างหน้า: date �
                                      "verified": verified}
     res = {c["ticker"]: cache.get((model, c["ticker"])) for c in coins}
     return {"by_ticker": {k: v for k, v in res.items() if v}, "log": log_}
+
+
+MACRO_TTL = 12 * 3600
+
+
+def macro_calendar_agent(client, model: str, tickers: list[str], cache: dict, days: int = 90) -> dict:
+    """ปฏิทินเหตุการณ์ที่จะกระทบตลาดคริปโต N วันข้างหน้า (Google Search) · cache 12 ชม."""
+    key = ("macro_cal", model, tuple(sorted(tickers)), days)
+    hit = cache.get(key)
+    if hit and time.time() - hit["ts"] < MACRO_TTL:
+        return hit
+    today = datetime.now(TZ_TH).strftime("%Y-%m-%d")
+    prompt = f"""วันนี้ {today}. คุณคือ Macro & Event Calendar Agent ใช้ Google Search หาเหตุการณ์ใน {days} วันข้างหน้า
+ที่มีผลต่อราคาคริปโต: ประชุม FED/FOMC, CPI, ตัวเลขจ้างงานสหรัฐ, กำหนดตัดสิน ETF คริปโต, กฎหมาย/การกำกับ,
+Token unlock ขนาดใหญ่, อัปเกรดเครือข่าย, เหตุการณ์ของ Exchange — โดยเฉพาะที่เกี่ยวกับเหรียญ: {', '.join(tickers)}
+สำหรับแต่ละเหตุการณ์: date (YYYY-MM-DD ถ้ารู้วันแน่ ไม่งั้น YYYY-MM), title, category, coins (ticker ที่กระทบโดยตรง ว่าง = ทั้งตลาด),
+direction (POSITIVE/NEGATIVE/MIXED = ผลที่คาดต่อราคาคริปโต ถ้าขึ้นกับผลประกาศให้ใช้ MIXED แล้วอธิบายใน why ว่าออกแบบไหนเป็นบวก/ลบ),
+impact, certainty, why (ภาษาไทย 1 ประโยค), source_url (ลิงก์จริงที่ค้นเจอ)
+กฎ: ใช้ข้อมูลที่ค้นเจอจริงเท่านั้น ห้ามแต่งวันที่ ไม่พบให้ใส่ list ว่าง เรียงตามวันที่ ไม่เกิน 20 รายการ"""
+    out, srcs, mode, errs = gemini_json(client, model, prompt, MacroCalendar, search=True)
+    res = {"ts": time.time(), "events": [e.model_dump() for e in out.events] if out else [], "sources": srcs,
+           "mode": mode, "verified": "search" in mode, "errors": errs}
+    if out:
+        cache[key] = res
+    return res
+
+
+class Scenario(BaseModel):
+    name: Literal["BULL", "BASE", "BEAR"]
+    trigger: str        # เงื่อนไขที่ทำให้เกิด (อ้างระดับราคาจากข้อมูลระบบ)
+    target: str         # ราคาเป้าหมาย/กรอบราคา (จากข้อมูลระบบเท่านั้น)
+    action: str         # ควรทำอะไร
+
+
+class FocusReport(BaseModel):
+    thesis: str                 # ข้อสรุปหลัก 2-3 ประโยค
+    timeframe_read: str         # อ่านหลายกรอบเวลาอย่างไร
+    best_strategy: str          # กลยุทธ์ที่เหมาะกับเหรียญนี้ตอนนี้ + เหตุผล
+    vs_peers: str               # เทียบกับเหรียญกลุ่มเดียวกัน
+    scenarios: list[Scenario]
+    checklist: list[str]        # สิ่งที่ต้องเช็กก่อนกดซื้อ
+
+
+def focus_ai(client, model: str, brief: dict, deep_b: dict, roadmap_rows: list[dict]) -> tuple[FocusReport | None, list[str]]:
+    """AI วิเคราะห์เจาะลึก 1 เหรียญ จากตัวเลขที่ระบบคำนวณแล้ว (ห้ามคิดราคาใหม่)"""
+    prompt = f"""คุณคือ Senior Crypto Analyst วิเคราะห์เจาะลึกเหรียญ {brief['ticker']} สำหรับนักลงทุน Spot (ไม่ใช้ leverage)
+ข้อมูลรายเหรียญ (ระบบคำนวณแล้ว): {json.dumps(brief, ensure_ascii=False, default=str)}
+หลายกรอบเวลา + Backtest 6 กลยุทธ์ + เทียบคู่แข่ง: {json.dumps(deep_b, ensure_ascii=False, default=str)}
+ข่าว/อีเวนต์ข้างหน้า: {json.dumps(roadmap_rows[:12], ensure_ascii=False, default=str)}
+
+เขียน:
+- thesis: ข้อสรุปหลัก 2-3 ประโยค (ซื้อ/รอ/เลี่ยง + เพราะอะไร)
+- timeframe_read: กรอบใหญ่บอกทิศ กรอบเล็กบอกจังหวะ ตอนนี้เป็นอย่างไร
+- best_strategy: เลือกกลยุทธ์จาก strategies ที่เหมาะกับเหรียญนี้ อ้าง Sharpe/DD/OOS จริง ถ้าไม่มีตัวไหนผ่านให้บอกตรงๆ
+- vs_peers: แข็งหรืออ่อนกว่าเหรียญกลุ่มเดียวกัน อันดับที่เท่าไหร่
+- scenarios: BULL / BASE / BEAR อย่างละ 1 · trigger และ target ต้องใช้ราคาที่อยู่ในข้อมูล (buy_zone, sl, tp1, tp2, forecast, dca, stop_weekly) เท่านั้น
+  ห้ามใส่ความน่าจะเป็นที่ไม่มีในข้อมูล
+- checklist: 3-5 ข้อที่ต้องเช็กก่อนกดซื้อ
+ภาษาไทย กระชับ ห้ามรับประกันผล"""
+    out, _, _, errs = gemini_json(client, model, prompt, FocusReport, search=False)
+    return out, errs
+
+
+def enforce_buy_score(ai_score: float | None, sys_score: float, band: float = 15.0) -> float:
+    """AI ให้คะแนนได้ แต่ห่างจากคะแนนระบบได้ไม่เกิน ±band (กัน AI มั่นใจเกินหลักฐาน)"""
+    if ai_score is None:
+        return float(sys_score)
+    return float(np.clip(ai_score, max(0.0, sys_score - band), min(100.0, sys_score + band)))
 
 
 # ───────────────────────── Strategist + Risk Manager ─────────────────────────
@@ -269,6 +360,20 @@ def coin_brief(c: dict, research: dict | None) -> dict:
         "chart_patterns": [{"name": p["name"], "bias": p["bias"], "state": p["state"], "target": _r(p["target"], 6),
                             "p_target_60d": _r(p.get("p_target_60"))} for p in c.get("patterns", [])],
         "scanner_tags": c.get("scan_tags", []),
+        "source": "scanner" if c.get("is_pick") else "watchlist",
+        "momentum": {"vs_market_pct": _r(c.get("xs_pct")), "trend_0_1": _r((c.get("mom") or {}).get("trend")),
+                     "ret30": _r(((c.get("mom") or {}).get("ret") or {}).get(30), 3),
+                     "ret90": _r(((c.get("mom") or {}).get("ret") or {}).get(90), 3),
+                     "risk_adj": _r((c.get("mom") or {}).get("risk_adj")),
+                     "orderflow_7v30": _r((c.get("mom") or {}).get("orderflow"), 3),
+                     "pullback_in_uptrend_4h": bool(m.get("mr4h"))},
+        "entry_gate_fails": c.get("gate_fails", []),
+        "techniques": [f"{'+' if t['vote'] > 0 else '−' if t['vote'] < 0 else '0'} {t['name']}: {t['detail']}"
+                       for t in (c.get("tech") or {}).get("votes", [])],
+        "tech_agreement_0_100": _r((c.get("tech") or {}).get("score"), 0),
+        "buy_score_system": _r(c.get("buy_sys"), 0),
+        "p_up_horizon": _r(c.get("p_up_h")),
+        "upcoming_news_net": _r(c.get("event_net")),
         "research": {"verified": (research or {}).get("verified"), "catalyst_score": rd.get("catalyst_score"),
                      "bull": rd.get("bull_case"), "bear": rd.get("bear_case"),
                      "events": [f"{e['date']} {e['type']} {e['title']} ({e['impact']})" for e in rd.get("events", [])[:4]]},
@@ -340,7 +445,7 @@ def fallback_strategy(coins: list[dict], n_med: int, n_long: int) -> list[dict]:
 
 
 def strategist_and_risk(client, model, coins, research, macro, corr, n_med, n_long,
-                        progress: Progress | None = None, horizon: int = 30) -> dict:
+                        progress: Progress | None = None, horizon: int = 30, xs_bt: dict | None = None) -> dict:
     coins_by = {c["ticker"]: c for c in coins}
     briefs = [coin_brief(c, research.get(c["ticker"])) for c in coins]
     bmap = {b["ticker"]: b for b in briefs}
@@ -355,6 +460,12 @@ range_p25_p75 = กรอบราคาปลายงวด 50% กลาง, 
 oos_expectancy_R = ผล backtest ช่วงข้อมูลล่าสุดที่ไม่ได้ใช้ปรับแต่ง (ติดลบ = ระวัง)
 chart_patterns = รูปแบบกราฟที่ระบบตรวจพบ (p_target_60d = โอกาสแตะเป้าใน 60 วันจากสถิติ), scanner_tags = สัญญาณจาก Scanner
 ผู้ใช้สนใจกรอบเวลา {horizon} วัน: ให้น้ำหนักเหรียญที่มีโอกาสขึ้นในช่วงนี้ (forecast, รูปแบบกราฟ, ข่าว, อีเวนต์โปรเจกต์ที่สอดคล้องกัน)
+source = "watchlist" คือเหรียญที่ผู้ใช้สนใจเอง (≤3), "scanner" คือเหรียญที่ระบบคัดจากตลาดตอนนี้
+momentum.vs_market_pct = momentum ปรับความผันผวนเทียบเหรียญอื่นในตลาด (1 = แข็งที่สุด), trend_0_1 = สัดส่วน Donchian 5 lookback ที่อยู่ในเทรนด์,
+pullback_in_uptrend_4h = 1D ขาขึ้นแต่ 4H ย่อต่ำกว่าค่าเฉลี่ยมาก (จังหวะเข้าแบบ mean reversion ระยะสั้น), entry_gate_fails = เกณฑ์จุดเข้าที่ยังไม่ผ่าน
+ผล Backtest ของการจัดอันดับ momentum เทียบตลาด (ถือ top-5 ทีละ 7 วัน เทียบถือทุกเหรียญ): {json.dumps(xs_bt or {}, ensure_ascii=False, default=str)}
+· ถ้าผล backtest นี้ไม่มี edge ห้ามใช้ momentum เป็นเหตุผลหลัก · momentum สูง+ผันผวนสูงเสี่ยง crash ให้ลด allocation
+· เหรียญ scanner ต้องอธิบายใน coin_views ว่าทำไมน่าสนใจ "ตอนนี้" และแยกให้ชัดว่าผ่านเกณฑ์จุดเข้าแล้ว หรือยังเป็นแค่ตัวที่ควรเฝ้าดู
 
 งาน 1 (picks): คัด MEDIUM ≤ {n_med} และ LONG ≤ {n_long} เหรียญ พร้อม allocation_pct และ cash_pct รวม = 100
 กฎ: altcoin ≤ 15% (เหรียญผันผวนสูงระบบจะลดเหลือ 10%/6%), BTC/ETH ≤ 35% · ห้าม MEDIUM ที่ status 🔴 หรือ regime ขาลง
@@ -366,6 +477,11 @@ chart_patterns = รูปแบบกราฟที่ระบบตรวจ
   reasons = 3 เหตุผลหลัก (เทคนิค + สถิติ + พื้นฐาน/ข่าว) ข้อละ 1 ประโยค
   invalidation = เงื่อนไขที่ทำให้มุมมองผิด (อ้างระดับราคา SL/โครงสร้าง)
   watch = สิ่งที่ต้องจับตา/อีเวนต์ถัดไป
+  buy_score = ความเห็นของคุณ 0-100 ว่าควรซื้อเหรียญนี้ "ตอนนี้" แค่ไหนจากข้อมูลทั้งหมด (เทคนิค สถิติ ข่าว อีเวนต์ข้างหน้า มหภาค)
+     เริ่มจาก buy_score_system แล้วปรับได้ไม่เกิน ±15 (ระบบจะตัดส่วนเกิน) · ห้ามให้สูงถ้า entry_gate_fails ยังมีข้อสำคัญ
+  outlook = BULLISH/BEARISH/NEUTRAL · key_techniques = เทคนิคหลัก 2-4 ข้อจาก techniques ที่ทำให้สรุปแบบนี้ (ระบุ +/−)
+p_up_horizon = โอกาสปิดสูงกว่าวันนี้ในกรอบเวลาที่เลือกจากสถิติย้อนหลัง · tech_agreement = เทคนิคเห็นตรงกันแค่ไหน (ไม่ใช่ความน่าจะเป็น)
+upcoming_news_net = ผลรวมข่าว/อีเวนต์ข้างหน้า (-1..1) จาก Roadmap
 เขียนภาษาไทย กระชับ ตรงประเด็น"""
     so, _, mode_s, err_s = gemini_json(client, model, sp, StrategistOut, search=False)
     if not so:
