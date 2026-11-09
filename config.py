@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "6.2.0"
+__version__ = "6.3.0"
 
 import functools
 import numpy as np
@@ -77,12 +77,13 @@ MAJORS = {"BTC", "ETH"}
 TIER_W = {"🟢": (0.40, 0.35, 0.25), "🟡": (0.25, 0.40, 0.35), "🔴": (0.15, 0.40, 0.45)}
 STATUS_TXT = {"🟢": "ซื้อได้", "🟡": "รอย่อ/Confirm", "🔴": "ยังไม่ควรซื้อ"}
 REG_TH = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่าน", "DOWN": "ขาลง"}
-STABLES = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "PYUSD", "XUSD", "RLUSD",
+STABLES = {"XAUT", "USDF", "EURC", "USD0", "USDX", "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "PYUSD", "XUSD", "RLUSD",
            "BFUSD", "USDS", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "PAXG", "WBTC", "WBETH", "BNSOL"}
 DEFAULT_WATCH = "SOL"
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-3-flash-preview"]
-MODEL_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
+AUTO_MODEL = "อัตโนมัติ (แนะนำ)"  # ถาม Google ว่ามีโมเดลไหนใช้ได้ แล้วเลือกตัวใหม่สุดเอง (Gemini 2.5 ปิดไปแล้ว 16 ต.ค. 2026)
+GEMINI_MODELS = [AUTO_MODEL, "gemini-flash-latest", "gemini-pro-latest", "gemini-flash-lite-latest"]
+MODEL_FALLBACK = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"]  # alias ที่ Google ชี้ไปรุ่นล่าสุดเสมอ
 RESEARCH_TTL = 6 * 3600
 
 CG_BASE = "https://api.coingecko.com/api/v3"
