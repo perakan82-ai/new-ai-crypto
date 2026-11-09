@@ -88,6 +88,7 @@ class CoinView(BaseModel):
     buy_score: int = 50                       # ความเห็น AI: ควรซื้อแค่ไหน 0-100 (ระบบจำกัดให้ห่างคะแนนระบบ ≤ ±15)
     outlook: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL"
     key_techniques: list[str] = []            # เทคนิคหลักที่ทำให้สรุปแบบนี้
+    wait_plan: str = ""                       # ถ้ายังไม่แนะนำ: เหตุการณ์ที่กำลังเกิด · อาจร่วงถึง · จะจบเมื่อไหร่ · กลับมาซื้อเมื่อไหร่
 
 
 class StrategistOut(BaseModel):
@@ -312,9 +313,22 @@ class RoadmapItem(BaseModel):
     source_url: str
 
 
+class Backer(BaseModel):
+    name: str
+    kind: Literal["VC", "INSTITUTION", "ETF", "TREASURY_COMPANY", "EXCHANGE", "FOUNDATION", "STRATEGIC", "OTHER"]
+    detail: str                 # ลงทุนเมื่อไหร่ รอบไหน จำนวนเท่าไหร่ (ถ้าค้นเจอ)
+    source_url: str
+
+
 class ProjectDeep(BaseModel):
     summary: str                # โปรเจกต์ทำอะไร แก้ปัญหาอะไร
     category: str
+    use_cases: list[str] = []   # ใช้ทำอะไรได้จริง
+    token_utility: str = ""     # เหรียญใช้ทำอะไรในระบบ (ค่าธรรมเนียม, stake, governance …)
+    founded: str = ""           # ปีที่ก่อตั้ง/เปิดตัว
+    team: str = ""              # ผู้ก่อตั้ง/บริษัทหลัก
+    funding: str = ""           # ระดมทุนรวม/รอบล่าสุด
+    backers: list[Backer] = []  # นายทุนใหญ่: VC, สถาบัน, ETF, บริษัทถือเหรียญ
     roadmap: list[RoadmapItem]  # ปีนี้ + ปีหน้า
     tokenomics: str             # supply, inflation, unlock schedule
     adoption: str               # ตัวชี้วัดการใช้งานจริง (TVL, ผู้ใช้, รายได้) ที่ค้นเจอ
@@ -353,14 +367,18 @@ def project_deep_agent(client, model: str, c: dict, cache: dict, headlines: list
 ค้นจาก: เว็บไซต์/บล็อกทางการ, เอกสาร roadmap/whitepaper, GitHub/forum governance, Token unlock trackers, ข่าวจากสื่อคริปโตหลัก
 หัวข่าวล่าสุดที่ระบบเก็บได้: {json.dumps((headlines or [])[:8], ensure_ascii=False)}
 ให้:
-- summary: โปรเจกต์ทำอะไร แก้ปัญหาอะไร (2-3 ประโยค), category
+- summary: โปรเจกต์ทำอะไร แก้ปัญหาอะไร (2-3 ประโยค เข้าใจง่ายสำหรับมือใหม่), category
+- use_cases: ใช้ทำอะไรได้จริง 2-5 ข้อ · token_utility: ตัวเหรียญใช้ทำอะไรในระบบ
+- founded: ปีก่อตั้ง/เปิด mainnet · team: ผู้ก่อตั้ง/บริษัทหลักที่พัฒนา · funding: ระดมทุนรวมและรอบสำคัญ (จำนวน+ปี ถ้าค้นเจอ)
+- backers: นายทุนใหญ่ 3-10 ราย เช่น VC ที่ลงทุน (a16z, Paradigm, Multicoin …), สถาบัน/ETF ที่ถือ,
+  บริษัทที่ถือเหรียญเป็นทุนสำรอง (treasury company), Exchange/พันธมิตรเชิงกลยุทธ์ · kind, detail, source_url (ลิงก์จริง)
 - roadmap: เหตุการณ์/เป้าหมายของปี {y} และ {y + 1} (5-12 รายการ) ทั้งที่เสร็จแล้วล่าสุดและที่วางแผนไว้:
   period (YYYY-MM-DD / YYYY-MM / YYYY-Qn / YYYY), title, kind, status, direction (ผลต่อราคา +/−/±), impact, why, source_url (ลิงก์จริง)
   รวม token unlock ก้อนใหญ่ด้วย (direction NEGATIVE)
 - tokenomics: supply หมุนเวียน/สูงสุด, เงินเฟ้อ, ตาราง unlock
 - adoption: ตัวเลขการใช้งานจริงที่ค้นเจอ (TVL, ผู้ใช้, ธุรกรรม, รายได้) พร้อมช่วงเวลา
 - competitors: คู่แข่งหลัก 2-5 ตัว · growth_drivers: ปัจจัยที่จะทำให้โต 3-5 ข้อ · risks: ความเสี่ยง 3-5 ข้อ
-- growth_view: HIGH/MEDIUM/LOW ศักยภาพเติบโต 1-2 ปีเทียบคู่แข่ง + growth_reason
+- growth_view: HIGH/MEDIUM/LOW ศักยภาพเติบโต 1-2 ปีเทียบคู่แข่ง + growth_reason (อ้าง adoption, roadmap, นายทุน, tokenomics)
 กฎ: ใช้ข้อมูลที่ค้นเจอจริงเท่านั้น ห้ามแต่งวันที่/ตัวเลข ห้ามใส่ราคาเป้าหมาย ไม่พบให้เว้นว่าง ภาษาไทย (ชื่อเฉพาะอังกฤษได้)"""
     out, srcs, mode, errs = gemini_json(client, model, prompt, ProjectDeep, search=True)
     if not out:
@@ -461,6 +479,13 @@ def coin_brief(c: dict, research: dict | None) -> dict:
         "score_backtest": {k: (c.get("score_check") or {}).get(k) for k in ("verdict", "skill", "hit", "p_today", "n_today")},
         "p_up_horizon": _r(c.get("p_up_h")),
         "upcoming_news_net": _r(c.get("event_net")),
+        "market_read": ({"phase": c["read"]["phase"], "phase_why": c["read"]["phase_why"],
+                         "pressure": [("+" if e["sign"] > 0 else "−") + " " + e["text"] for e in c["read"]["evidence"]],
+                         "dip50": _r(c["read"]["downside"]["dip50"], 6), "dip30": _r(c["read"]["downside"]["dip30"], 6),
+                         "buy_zone": [_r(x, 6) for x in c["read"]["downside"]["buy_zone"]],
+                         "days_to_low_p50": (c["read"]["timing"] or {}).get("p50"),
+                         "days_to_low_p25_p75": [(c["read"]["timing"] or {}).get("p25"), (c["read"]["timing"] or {}).get("p75")],
+                         "flip_conditions": c["read"]["flip"]} if c.get("read") else None),
         "research": {"verified": (research or {}).get("verified"), "catalyst_score": rd.get("catalyst_score"),
                      "bull": rd.get("bull_case"), "bear": rd.get("bear_case"),
                      "events": [f"{e['date']} {e['type']} {e['title']} ({e['impact']})" for e in rd.get("events", [])[:4]]},
@@ -567,6 +592,10 @@ pullback_in_uptrend_4h = 1D ขาขึ้นแต่ 4H ย่อต่ำก
   buy_score = ความเห็นของคุณ 0-100 ว่าควรซื้อเหรียญนี้ "ตอนนี้" แค่ไหนจากข้อมูลทั้งหมด (เทคนิค สถิติ ข่าว อีเวนต์ข้างหน้า มหภาค)
      เริ่มจาก buy_score_system แล้วปรับได้ไม่เกิน ±15 (ระบบจะตัดส่วนเกิน) · ห้ามให้สูงถ้า entry_gate_fails ยังมีข้อสำคัญ
   outlook = BULLISH/BEARISH/NEUTRAL · key_techniques = เทคนิคหลัก 2-4 ข้อจาก techniques ที่ทำให้สรุปแบบนี้ (ระบุ +/−)
+  wait_plan = ถ้ายังไม่ควรซื้อ (แม้จะอันดับดีที่สุดในตาราง): 2-4 ประโยค อธิบายจาก market_read ว่า
+     ตอนนี้เกิดเหตุการณ์อะไร (phase) · หลักฐานแรงขาย/Volume/Divergence · ราคาอาจย่อถึงเท่าไหร่ (dip50/dip30)
+     · คาดว่าการย่อจะจบในกี่วัน (days_to_low) · กลับมาซื้อได้เมื่อไหร่/ที่ราคาไหน (buy_zone + flip_conditions)
+     ใช้เฉพาะตัวเลขที่ให้มา · ถ้าแนะนำซื้อ ให้ใส่ว่าถ้าผิดทางจะเกิดอะไรและออกที่ไหน
 p_up_horizon = โอกาสปิดสูงกว่าวันนี้ในกรอบเวลาที่เลือกจากสถิติย้อนหลัง · tech_agreement = เทคนิคเห็นตรงกันแค่ไหน (ไม่ใช่ความน่าจะเป็น)
 upcoming_news_net = ผลรวมข่าว/อีเวนต์ข้างหน้า (-1..1) จาก Roadmap
 เขียนภาษาไทย กระชับ ตรงประเด็น"""
