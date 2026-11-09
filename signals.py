@@ -55,6 +55,12 @@ def risk_factors(c: dict, macro: dict, news: dict | None) -> list[str]:
         out.append(f"ตัวอย่างสถิติน้อย (n={m['ft1']['n_eff']})")
     if news and news.get("score", 0) < -0.15:
         out.append(f"ข่าวเชิงลบ ({news['score']:+.2f})")
+    mo = c.get("mom") or {}
+    r30 = (mo.get("ret") or {}).get(30)
+    if r30 is not None and r30 > 0.5 and r["vol_ann"] > 0.9:  # Grobys et al. 2025: momentum คริปโต crash แรง
+        out.append(f"ขึ้นมาแรง {r30 * 100:.0f}% ใน 30 วัน + ผันผวนสูง → เสี่ยงย่อแรง ควรลดขนาดไม้")
+    if mo.get("trend") is not None and mo["trend"] < 0.4:
+        out.append(f"Trend ensemble อ่อน ({mo['trend'] * 5:.0f}/5 lookback อยู่ในเทรนด์)")
     fd = (c["fund"] or {}).get("fdv_mcap")
     if fd and fd > 2:
         out.append(f"FDV/MCap {fd:.1f}x — มี supply รอปลดล็อกมาก")
