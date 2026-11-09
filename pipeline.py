@@ -17,7 +17,7 @@ from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, m
                 strategist_and_risk)
 from config import (FEE, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
                     STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
-from analysis import technical_votes
+from analysis import _fc_samples, technical_votes
 from ai import coin_brief, enforce_horizon_views, focus_ai, project_deep_agent
 from deep import deep_analysis, deep_brief, horizon_outlook, peers_for, score_check
 from analysis import (BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent,
@@ -805,6 +805,155 @@ def outlook_label(c: dict) -> str:
     return "⚪ กลาง"
 
 
+def downside_plan(c: dict, horizon: int = 30) -> dict:
+    """กรณียังไม่แนะนำซื้อ: ราคาอาจร่วงถึงไหน · แนวรับ · โซนที่ควรพิจารณาซื้อ · เงื่อนไขที่จะเปลี่ยนเป็นน่าซื้อ
+    ทุกตัวเลขมาจากสถิติของเหรียญนี้ (ปรับตามความผันผวนปัจจุบัน) + แนวรับจริง — ไม่ใช่การรับประกัน"""
+    H = horizon_bucket(max(horizon, 14))
+    price = c["price"]
+    fc = c["fc"].get(H) or {}
+    d = c["d1"].iloc[-1]
+    atr_ = float(d.atr)
+    sup = sorted([L for L in c["levels"] if L["level"] < price * 0.99 and L["strength"] >= 2],
+                 key=lambda L: -L["level"])[:3]
+    supports = [{"level": L["level"], "src": L["src"], "strength": L["strength"],
+                 "p": touch_prob(c, L["level"], H)} for L in sup]
+    dip50, dip30 = fc.get("dip50"), fc.get("dip30")
+    # โซนน่าซื้อ = แนวรับแข็งแรงที่ใกล้จุดย่อ 50% ที่สุด (ถ้าไม่มี ใช้ DCA ไม้แรกของแผนระยะยาว)
+    anchor = dip50 if dip50 else price * 0.9
+    if supports:
+        best = min(supports, key=lambda x: abs(x["level"] - anchor))
+        zone = (best["level"] - 0.3 * atr_, best["level"] + 0.2 * atr_)
+        why = f"แนวรับ {best['src']} (ความแข็งแรง {best['strength']:.0f}) ใกล้จุดที่สถิติบอกว่ามีโอกาสย่อถึง"
+    else:
+        t1 = c["long"]["tiers"][0] if c["long"]["tiers"][0] < price else c["long"]["tiers"][1]
+        zone = (t1 - 0.3 * atr_, t1 + 0.2 * atr_)
+        why = "DCA ไม้แรกของแผนระยะยาว (แนวรับ/Fib/EMA รายสัปดาห์)"
+    # เงื่อนไขกลับมาน่าซื้อ: ยืนเหนือ EMA50 + ทะลุ swing high ล่าสุด (หรือ High 20 วัน)
+    hi20 = float(c["d1"]["high"].iloc[-20:].max())
+    sh = c["struct_d"].get("last_high") or hi20
+    flip = []
+    if np.isfinite(d.ema50) and price < d.ema50:
+        flip.append(f"ปิดรายวันกลับเหนือ EMA50 ({fp(d.ema50)})")
+    if c["cf"]["regime"] == "DOWN" and np.isfinite(d.ema200):
+        flip.append(f"ยืนเหนือ EMA200 ({fp(d.ema200)}) = จบขาลงหลัก")
+    flip.append(f"ทะลุ High ล่าสุด {fp(min(sh, hi20) if sh > price else hi20)} พร้อม Volume")
+    flip.append("คะแนนควรซื้อ ≥ 55 และผ่านเกณฑ์จุดเข้าในแท็บนี้")
+    return {"H": H, "dip50": dip50, "dip30": dip30, "p_dip50": 0.5 if dip50 else None, "supports": supports,
+            "buy_zone": zone, "buy_zone_p": touch_prob(c, zone[1], H), "buy_zone_why": why, "flip": flip,
+            "long_stop": c["long"]["stop"]}
+
+
+def pressure_evidence(c: dict) -> list[dict]:
+    """หลักฐานแรงซื้อ/แรงขายจาก Volume, Order flow, OBV, Divergence (แท่ง 1D ที่ปิดแล้ว)"""
+    d = c["d1"]
+    x = d.iloc[-10:]
+    out = []
+
+    def add(sign: int, text: str):
+        out.append({"sign": sign, "text": text})
+
+    red = x["close"] < x["open"]
+    dv = float(x.loc[red, "qvol"].sum() / max(x["qvol"].sum(), 1e-9))
+    if dv >= 0.6:
+        add(-1, f"แรงขายครอง: Volume ของวันแดง {dv * 100:.0f}% ใน 10 วันล่าสุด")
+    elif dv <= 0.4:
+        add(1, f"แรงซื้อครอง: Volume ของวันเขียว {(1 - dv) * 100:.0f}% ใน 10 วันล่าสุด")
+    last20 = d.iloc[-20:]
+    dist_days = int(((last20["close"] < last20["close"].shift() * 0.99) & (last20["vol_ratio"] > 1.2)).sum())
+    if dist_days >= 4:
+        add(-1, f"วันเทขาย (ลง >1% พร้อม Volume สูง) {dist_days} วันใน 20 วัน")
+    of = (c.get("mom") or {}).get("orderflow")
+    if of is not None and abs(of) >= 0.02:
+        add(1 if of > 0 else -1, f"แรงซื้อเชิงรุก (taker buy) 7 วัน {'สูง' if of > 0 else 'ต่ำ'}กว่าค่าเฉลี่ย 30 วัน {of * 100:+.1f}%")
+    obv_up = d["obv"].iloc[-1] > d["obv"].iloc[-21]
+    px_up = d["close"].iloc[-1] > d["close"].iloc[-21]
+    if px_up and not obv_up:
+        add(-1, "ราคาขึ้นแต่ OBV ลง (Divergence) — การขึ้นไม่มี Volume สนับสนุน")
+    elif not px_up and obv_up:
+        add(1, "ราคาลงแต่ OBV ขึ้น — มีการสะสมระหว่างราคาลง")
+    a, b = d.iloc[-10:], d.iloc[-30:-10]
+    if len(b) > 5:
+        if a["high"].max() > b["high"].max() and a["rsi"].max() < b["rsi"].max() - 3:
+            add(-1, f"Bearish divergence: ราคาทำ High ใหม่ แต่ RSI ต่ำกว่าเดิม ({a['rsi'].max():.0f} < {b['rsi'].max():.0f})")
+        if a["low"].min() < b["low"].min() and a["rsi"].min() > b["rsi"].min() + 3:
+            add(1, f"Bullish divergence: ราคาทำ Low ใหม่ แต่ RSI สูงกว่าเดิม ({a['rsi'].min():.0f} > {b['rsi'].min():.0f})")
+    lb = d.iloc[-1]
+    if lb.close < lb.open and lb.vol_ratio >= 2:
+        add(-1, f"แท่งล่าสุดลงพร้อม Volume {lb.vol_ratio:.1f} เท่าของปกติ")
+    if lb.macd_h < d["macd_h"].iloc[-2] < 0:
+        add(-1, "MACD Histogram ติดลบและยังลดลง — แรงลงยังไม่หมด")
+    elif d["macd_h"].iloc[-2] < lb.macd_h < 0:
+        add(1, "MACD Histogram ติดลบแต่เริ่มหดตัว — แรงขายเริ่มอ่อน")
+    return out
+
+
+def market_phase(c: dict, ev: list[dict]) -> tuple[str, str]:
+    """เหรียญอยู่ในเหตุการณ์แบบไหน (กฎง่ายๆ จากเทรนด์ + RSI + Bollinger + หลักฐานแรงขาย)"""
+    d = c["d1"].iloc[-1]
+    reg = c["cf"]["regime"]
+    tr = (c.get("mom") or {}).get("trend") or 0
+    rsi, z = float(d.rsi), float(d.bb_z) if np.isfinite(d.bb_z) else 0.0
+    sell = sum(e["sign"] < 0 for e in ev)
+    ret10 = float(c["d1"]["close"].iloc[-1] / c["d1"]["close"].iloc[-11] - 1)
+    if reg == "DOWN" and rsi < 32 and ret10 < -0.12:
+        return "🩸 ขายตื่นตระหนก (Capitulation)", "ร่วงแรงในเวลาสั้น RSI ต่ำมาก — มักใกล้จุดต่ำ แต่ต้องรอแท่งกลับตัวยืนยันก่อน"
+    if reg == "DOWN":
+        return "🔻 ขาลง (Downtrend)", "ราคาอยู่ใต้เส้นค่าเฉลี่ยหลัก การซื้อสวนเทรนด์มีโอกาสติดดอยสูง"
+    if reg == "UP" and (sell >= 2 or rsi > 72):
+        return "⚠️ แรงขายทำกำไร (Distribution)", "แนวโน้มยังขึ้น แต่เริ่มมีสัญญาณแรงขายออก — มักย่อก่อนไปต่อ"
+    if reg == "UP" and z < 0:
+        return "📉 ย่อในเทรนด์ขาขึ้น (Pullback)", "แนวโน้มหลักยังดี ราคากำลังพักตัว — รอให้ย่อถึงแนวรับแล้วกลับตัว"
+    if reg == "UP" and tr >= 0.6:
+        return "🚀 เทรนด์ขาขึ้นแข็งแรง", "ราคาไปต่อได้ แต่ไม่ควรไล่ราคา รอย่อเข้าโซน"
+    if float(c["d1"]["bb_width"].iloc[-1]) <= float(c["d1"]["bb_width"].iloc[-120:].quantile(0.2)):
+        return "⏸ สะสมพลัง / ไซด์เวย์แคบ (Base)", "ราคาบีบตัวแคบ — รอเลือกทาง ทะลุขึ้นค่อยตาม"
+    return "↔️ ไซด์เวย์ / ทิศทางไม่ชัด", "ยังไม่มีฝั่งไหนชนะชัดเจน"
+
+
+def dip_timing(c: dict, H: int = 30, min_dip: float = 0.03) -> dict | None:
+    """ในอดีตที่สภาพตลาดคล้ายวันนี้ ถ้าราคาย่อ ≥3% → จุดต่ำสุดมักเกิดหลังจากนี้กี่วัน (ใช้ประมาณว่าการย่อจะจบเมื่อไหร่)"""
+    S = _fc_samples(c, H)
+    if S is None:
+        return None
+    rl = S["rel_l"]
+    dipped = rl.min(axis=1) <= -min_dip
+    if dipped.sum() < 10:
+        return None
+    days = rl[dipped].argmin(axis=1) + 1
+    return {"p25": float(np.percentile(days, 25)), "p50": float(np.median(days)), "p75": float(np.percentile(days, 75)),
+            "n": int(dipped.sum()), "share": float(dipped.mean())}
+
+
+def market_read(c: dict, horizon: int = 30, ts: datetime | None = None, rank: int | None = None) -> dict:
+    """อ่านสถานการณ์ 1 เหรียญ: ควรซื้อไหม · เหตุการณ์ที่กำลังเกิด · แรงซื้อ/ขาย · อาจร่วงถึงไหน · จะจบเมื่อไหร่ · กลับมาดูเมื่อไหร่"""
+    ts = ts or datetime.now(TZ_TH)
+    v = final_verdict(c)
+    ev = pressure_evidence(c)
+    phase, phase_why = market_phase(c, ev)
+    dn = downside_plan(c, horizon)
+    tm = dip_timing(c, min(dn["H"], 60))
+    z = dn["buy_zone"]
+    head = f"อันดับ {rank} ในตาราง แต่ " if rank == 1 and not v["recommend"] else (f"อันดับ {rank} · " if rank else "")
+    fails = c.get("gate_fails") or []
+    if v["recommend"]:
+        story = (f"{head}✅ แนะนำให้ซื้อได้ในโซน {fp(c['med']['zone'][0])}–{fp(c['med']['zone'][1])} · "
+                 f"ถ้าผิดทาง อาจย่อถึง {fp(dn['dip50'])} (โอกาส 50%) — SL {fp(c['med']['sl'])}")
+    else:
+        story = (f"{head}❌ ยังไม่แนะนำให้ซื้อตอนนี้ · กำลังอยู่ในช่วง {phase.split(' ', 1)[1]} · "
+                 f"มีโอกาส 50% ที่ราคาจะย่อถึง {fp(dn['dip50'])} ({dist(c, dn['dip50'])}) ภายใน {dn['H']} วัน"
+                 + (f" · ถ้าแย่กว่าปกติ {fp(dn['dip30'])}" if dn["dip30"] else "")
+                 + f" · โซนที่ควรพิจารณาซื้อ {fp(z[0])}–{fp(z[1])}"
+                 + (f" · ยังไม่ผ่าน: {' · '.join(fails[:2])}" if fails else ""))
+    when = None
+    if tm and not v["recommend"]:
+        d1, d2 = ts + pd.Timedelta(days=round(tm["p25"])), ts + pd.Timedelta(days=round(tm["p75"]))
+        when = (f"ในอดีตที่สภาพคล้ายกัน ถ้าราคาย่อ จุดต่ำมักเกิดภายใน ~{tm['p50']:.0f} วัน "
+                f"(ช่วง {d1:%d/%m} – {d2:%d/%m}) · กลับมาดูอีกครั้งราว {ts + pd.Timedelta(days=round(tm['p50'])):%d/%m/%Y} "
+                f"หรือทันทีที่ราคาเข้าโซนซื้อ (n={tm['n']})")
+    return {"ticker": c["ticker"], "verdict": v, "phase": phase, "phase_why": phase_why, "evidence": ev,
+            "downside": dn, "timing": tm, "when": when, "story": story, "flip": dn["flip"]}
+
+
 def final_verdict(c: dict, deep: dict | None = None) -> dict:
     """คำตอบเดียวสำหรับหน้าแรก: ซื้อ / รอ / เลี่ยง + ราคา + เหตุผล 3 ข้อ (ทุกตัวเลขมาจากระบบ)"""
     m = c["med"]
@@ -814,10 +963,10 @@ def final_verdict(c: dict, deep: dict | None = None) -> dict:
         act, color = "✅ ซื้อได้", "green"
         line = f"ตั้ง Limit {fp(m['zone'][0])} – {fp(m['zone'][1])} · SL {fp(m['sl'])} · TP1 {fp(m['tp1'])} · TP2 {fp(m['tp2'])}"
     elif m["status"] == "🔴" or score < 40:
-        act, color = "⛔ ยังไม่ควรซื้อ", "red"
+        act, color = "⛔ ยังไม่แนะนำให้ซื้อ", "red"
         line = f"แนวโน้มยังไม่เอื้อ · ถ้าจะสะสมระยะยาว DCA เริ่ม {fp(c['long']['tiers'][0])} ตัดขาดทุน Weekly < {fp(c['long']['stop'])}"
     else:
-        act, color = "⏳ รอจังหวะ", "orange"
+        act, color = "⏳ ยังไม่แนะนำให้ซื้อตอนนี้ — รอจังหวะ", "orange"
         line = f"ตั้งรอซื้อ {fp(m['zone'][0])} – {fp(m['zone'][1])} เมื่อผ่านเงื่อนไข: " + (" · ".join(fails[:2]) or "4H กลับตัว")
     pos = [x for x in c["tech"]["votes"] if x["vote"] > 0]
     neg = [x for x in c["tech"]["votes"] if x["vote"] < 0]
@@ -836,7 +985,7 @@ def final_verdict(c: dict, deep: dict | None = None) -> dict:
                + (f"{ck['hit'] * 100:.0f}%" if ck["hit"] is not None else "-")
                + f" · วันที่คะแนนใกล้วันนี้ ขึ้นจริง {ck['p_today'] * 100:.0f}% (n≈{ck['n_today']})")
     return {"action": act, "color": color, "line": line, "reasons": reasons, "score": score,
-            "p_up": c.get("p_up_h"), "accuracy": acc}
+            "p_up": c.get("p_up_h"), "accuracy": acc, "recommend": act.startswith("✅")}
 
 
 def decision_table(coins: list[dict], views: dict, horizon: int) -> pd.DataFrame:
@@ -857,6 +1006,8 @@ def decision_table(coins: list[dict], views: dict, horizon: int) -> pd.DataFrame
             "TP1 ก่อน SL": fprob(ft.get("p_tp")),
             "เทคนิค บวก/ลบ/กลาง": f"{t['bull']} / {t['bear']} / {t['neutral']}",
             "✅ เทคนิคที่บวก": " · ".join(pos) or "-", "❌ เทคนิคที่ลบ": " · ".join(neg) or "-",
+            "อาจร่วงถึง (50%)": fp((c["fc"].get(H) or {}).get("dip50")),
+            "โซนน่าซื้อ": (lambda z: f"{fp(z[0])}–{fp(z[1])}")(downside_plan(c, horizon)["buy_zone"]),
             "ข่าวข้างหน้า": f"{c.get('event_net', 0):+.2f}",
             "ทดสอบคะแนนย้อนหลัง": (c.get("score_check") or {}).get("verdict", "—").split(" ")[0],
             "AI สรุปจากเทคนิค": " · ".join(v.get("key_techniques") or []) or "-"})
@@ -938,6 +1089,8 @@ def analysis_export_df(res: dict, horizon: int) -> pd.DataFrame:
             "long_status": l["status"], "dca1": l["tiers"][0], "dca2": l["tiers"][1], "dca3": l["tiers"][2],
             "long_stop": l["stop"], "long_tp1": l["tp1"], "is_focus": is_focus,
             "score_test": (c.get("score_check") or {}).get("verdict"),
+            "dip50_h": (c["fc"].get(H) or {}).get("dip50"), "dip30_h": (c["fc"].get(H) or {}).get("dip30"),
+            "buy_zone_lo": downside_plan(c, horizon)["buy_zone"][0], "buy_zone_hi": downside_plan(c, horizon)["buy_zone"][1],
             "score_test_skill": (c.get("score_check") or {}).get("skill"),
             "score_test_p_today": (c.get("score_check") or {}).get("p_today"),
             "mtf_alignment": dd.get("alignment") if is_focus else None,
@@ -1209,6 +1362,7 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     for c in analyzed:
         c["event_net"] = event_net(roadmap, c["ticker"], max(H, 30))
         c["buy_sys"] = buy_score_sys(c)
+        c["read"] = market_read(c, cfg.horizon)  # ให้ AI ใช้หลักฐานเดียวกัน
 
     if cfg.client and cfg.ai_agents:
         port = strategist_and_risk(cfg.client, cfg.model, analyzed, research["by_ticker"], macro, corr,
@@ -1222,6 +1376,9 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
         v = views.get(c["ticker"]) or {}
         c["buy_ai"] = v.get("buy_score") if v else None
         c["buy_final"] = enforce_buy_score(c["buy_ai"], c["buy_sys"])
+    for i, c in enumerate(sorted(analyzed, key=lambda c: -c["buy_final"])):  # อ่านสถานการณ์อีกครั้งด้วยคะแนนสุดท้าย
+        c["read"] = market_read(c, cfg.horizon, rank=i + 1)
+        c["read"]["ai_wait"] = (views.get(c["ticker"]) or {}).get("wait_plan", "")
 
     deep = None
     fc_ = next((c for c in analyzed if watch and c["ticker"] == watch[0]), None)
