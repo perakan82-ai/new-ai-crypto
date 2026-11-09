@@ -290,7 +290,7 @@ def render_entries(res: dict, capital: float, risk_pct: float):
     sel = st.selectbox("🔍 แผนละเอียดรายเหรียญ", [c["ticker"] for c in coins], key="dd_sel")
     c = {x["ticker"]: x for x in coins}[sel]
     if go is not None:
-        st.plotly_chart(chart(c), use_container_width=True)
+        st.plotly_chart(chart(c), use_container_width=True, key="chart_entries")
     st.markdown(deep_dive_md(c, research, views, pick_by, capital, risk_pct, res.get("news")), unsafe_allow_html=True)
 
 
@@ -356,7 +356,7 @@ def render_horizons(dp: dict, c: dict, show_signals: bool = True):
         fig.add_hrect(y0=40, y1=60, fillcolor="#9ca3af", opacity=0.08, line_width=0)
         fig.update_layout(height=320, yaxis=dict(range=[0, 105], title="คะแนน"), template="plotly_dark",
                           margin=dict(l=8, r=8, t=20, b=8), legend=dict(orientation="h", y=1.12))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_horizons")
     st.dataframe(horizon_table(hz, hai), use_container_width=True, hide_index=True)
     st.caption("คะแนน ≥60 + โอกาสขึ้น ≥55% = ขึ้น · ≤40 + ≤45% = ลง · ที่เหลือ = ไซด์เวย์/ไม่ชัด · "
                "ความมั่นใจ 'สูง' = ตัวอย่างอิสระ ≥30 และ สถิติ/เทคนิค/ข่าว ชี้ทางเดียวกัน · "
@@ -535,7 +535,7 @@ def render_deep(res: dict, capital: float, risk_pct: float):
         st.dataframe(roadmap_df(rm), use_container_width=True, hide_index=True,
                      column_config={"ที่มา": st.column_config.LinkColumn()})
     if go is not None:
-        st.plotly_chart(chart(c), use_container_width=True)
+        st.plotly_chart(chart(c), use_container_width=True, key="chart_deep")
     views = (res.get("port") or {}).get("views") or {}
     pick_by = {(p["ticker"], p["horizon"]): p for p in res["port"]["picks"]}
     st.markdown(deep_dive_md(c, res["research"]["by_ticker"], views, pick_by, capital, risk_pct, res.get("news")),
@@ -571,7 +571,7 @@ def render_roadmap(res: dict):
         fig.add_vline(x=today, line_dash="dot", line_color="#38bdf8")
         fig.update_layout(height=max(280, 46 * len(ys) + 120), template="plotly_dark", margin=dict(l=8, r=8, t=30, b=8),
                           yaxis=dict(categoryorder="array", categoryarray=ys[::-1]), legend=dict(orientation="h", y=1.08))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="chart_roadmap")
         st.caption("วงกลมทึบ = ยืนยันแล้ว · วงกลมโปร่ง = คาดการณ์/ข่าวลือ · ขนาด = ผลกระทบ · เส้นฟ้า = วันนี้")
     st.dataframe(roadmap_df(rm), use_container_width=True, hide_index=True,
                  column_config={"ที่มา": st.column_config.LinkColumn()})
