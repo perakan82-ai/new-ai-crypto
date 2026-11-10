@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "6.3.0"
+__version__ = "6.4.0"
 
 import functools
 import numpy as np
@@ -20,7 +20,7 @@ BINANCE_HOSTS = ("https://data-api.binance.vision/api/v3", "https://api.binance.
 QUOTE = "USDT"
 TF_LIMIT = {"1h": 1000, "4h": 500, "1d": 1000, "1w": 1000}
 TF_TTL = {"1h": 300, "4h": 600, "1d": 600, "1w": 1800}  # เก็บแท่งเทียนใช้ซ้ำ (วินาที)
-WORKERS = 8
+WORKERS = 12  # ดึงแท่งเทียนพร้อมกัน (Binance จำกัด 6000 weight/นาที · 80 เหรียญใช้ ~400)
 MIN_BARS_1D = 62
 
 # ───────────── Costs (ใช้ทั้ง backtest และแผนจริง) ─────────────
@@ -85,6 +85,9 @@ AUTO_MODEL = "อัตโนมัติ (แนะนำ)"  # ถาม Google
 GEMINI_MODELS = [AUTO_MODEL, "gemini-flash-latest", "gemini-pro-latest", "gemini-flash-lite-latest"]
 MODEL_FALLBACK = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"]  # alias ที่ Google ชี้ไปรุ่นล่าสุดเสมอ
 RESEARCH_TTL = 6 * 3600
+AI_TIMEOUT_S = 90      # รอ Gemini ต่อครั้งสูงสุด (วินาที) · เกินนี้ถือว่าล่ม แล้วลองโมเดลถัดไป
+AI_BUDGET_S = 180      # เวลารวมสูงสุดต่อ 1 Agent (รวมทุกการลองซ้ำ) · หมดเวลา → ใช้ผลแบบ rule-based
+AI_MAX_MODELS = 3      # ลองโมเดลสำรองไม่เกินกี่ตัว (เดิมไล่ได้ถึง 7 ตัว × 3 โหมด)
 
 CG_BASE = "https://api.coingecko.com/api/v3"
 LLAMA = "https://api.llama.fi"
