@@ -851,6 +851,8 @@ def main():
     with st.expander("🌐 ภาพรวมตลาด (Macro)", expanded=False):
         st.markdown("\n".join(f"- {n}" for n in macro["notes"]))
         st.caption(f"Data: {res['host']} · AI: {port['mode']} · ใช้เวลา {res['elapsed']:.1f}s · {res['ts']:%d/%m %H:%M}")
+        if res.get("timings"):
+            st.caption("⏱ เวลาแต่ละขั้น: " + " · ".join(f"{k} {v:.0f}s" for k, v in res["timings"].items()))
 
     prob = ai_problem(res)
     if prob:
