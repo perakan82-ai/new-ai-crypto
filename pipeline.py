@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import sources as na
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pydantic import BaseModel
@@ -1225,48 +1226,99 @@ def btc_context(md: MarketData, cg_key: str, frames: dict | None = None) -> tupl
 
 
 # ───────────────────────── Deep dive (1 เหรียญ) ─────────────────────────
-def run_deep(md: MarketData, cfg: RunConfig, c: dict, raw: dict, research: dict, roadmap: list[dict]) -> dict:
-    """เจาะลึกเหรียญเดียว: ดึง 1H เพิ่ม + 1D ของคู่แข่ง → deep_analysis → (AI) บทวิเคราะห์ + สถานการณ์"""
-    t = c["ticker"]
+def deep_fetch(md: MarketData, c_symbol: str, ticker: str) -> tuple[pd.DataFrame | None, dict]:
+    """ดึงข้อมูลที่ Deep dive ต้องใช้ (1H ของเหรียญ + 1D ของคู่แข่ง) — ไม่แตะ UI จึงรันใน thread ได้"""
+    peers = peers_for(ticker)
+    extra = fetch_frames(md, [f"{p}{QUOTE}" for p in peers], ("1d",))
+    h1 = fetch_frames(md, [c_symbol], ("1h",)).get(c_symbol, {}).get("1h")
+    return h1, {p: (extra.get(f"{p}{QUOTE}") or {}).get("1d") for p in peers}
+
+
+def deep_data(md: MarketData, c: dict, raw: dict, fetched: tuple | None = None) -> dict:
+    """ส่วนคำนวณของ Deep dive (ไม่ใช้ AI): หลายกรอบเวลา + Backtest 6 กลยุทธ์ + เทียบคู่แข่ง"""
+    h1, peer_raw = fetched or deep_fetch(md, c["symbol"], c["ticker"])
     raw = dict(raw)
-    peers = peers_for(t)
-    extra = fetch_frames(md, [c["symbol"]] + [f"{p}{QUOTE}" for p in peers], ("1d",))
-    h1 = fetch_frames(md, [c["symbol"]], ("1h",)).get(c["symbol"], {}).get("1h")
     if h1 is not None:
         raw["1h"] = h1
-    peer_d1 = {}
-    for p in peers:
-        d = (extra.get(f"{p}{QUOTE}") or {}).get("1d")
-        if d is not None and len(d) >= 120:
-            peer_d1[p] = closed_only(add_indicators(d))
-    data = deep_analysis(c, raw, peer_d1)
+    peer_d1 = {p: closed_only(add_indicators(d)) for p, d in peer_raw.items() if d is not None and len(d) >= 120}
+    return deep_analysis(c, raw, peer_d1)
+
+
+def deep_finish(c: dict, data: dict, project: dict | None, roadmap: list[dict]) -> tuple[list[dict], dict, list[dict]]:
+    """รวม Roadmap โปรเจกต์ (AI ค้นเว็บ) เข้ากับมุมมองหลายช่วงเวลา · คืน (proj_rows, pdat, roadmap_rows สำหรับ AI)"""
+    t = c["ticker"]
+    pdat = (project or {}).get("data") or {}
+    cert = {"DONE": "CONFIRMED", "IN_PROGRESS": "EXPECTED", "PLANNED": "EXPECTED", "RUMOR": "RUMOR"}
+    ev = [{"date": x["period"], "type": x["kind"], "title": x["title"], "impact": x["impact"],
+           "certainty": cert.get(x["status"], "EXPECTED"), "source_url": x["source_url"], "direction": x["direction"],
+           "why": x["why"]} for x in pdat.get("roadmap", [])]
+    proj_rows = build_roadmap({t: {"verified": (project or {}).get("verified"), "data": {"events": ev}}}, None, [t])
+    g = {"HIGH": 0.2, "MEDIUM": 0.0, "LOW": -0.2}.get(pdat.get("growth_view"), 0.0)
+    news_long = float(np.clip(event_net(proj_rows, t, 365) + g, -1, 1))
+    data["horizons"] = horizon_outlook(c, data["snaps"], c.get("event_net", 0.0), news_long, data.get("checks"))
+    rows = [{k: r.get(k) for k in ("date", "scope", "title", "direction", "impact", "certainty", "why")}
+            for r in roadmap + proj_rows if t in r["coins"] or not r["coins"]]
+    return proj_rows, pdat, rows
+
+
+def run_deep(md: MarketData, cfg: RunConfig, c: dict, raw: dict, research: dict, roadmap: list[dict]) -> dict:
+    """เจาะลึกเหรียญเดียวแบบเรียงลำดับ (ใช้ใน scan_job/ทดสอบ) — run_pipeline ใช้เวอร์ชันขนาน"""
+    data = deep_data(md, c, raw)
     report, errs, project, proj_rows = None, [], None, []
     if cfg.client and cfg.ai_agents:
-        heads = na.headlines(cfg.news_items, t, 8) if cfg.news_items else []
+        heads = na.headlines(cfg.news_items, c["ticker"], 8) if cfg.news_items else []
         project = project_deep_agent(cfg.client, cfg.model_research, c, cfg.research_cache, heads)
-        pdat = (project or {}).get("data") or {}
-        cert = {"DONE": "CONFIRMED", "IN_PROGRESS": "EXPECTED", "PLANNED": "EXPECTED", "RUMOR": "RUMOR"}
-        ev = [{"date": x["period"], "type": x["kind"], "title": x["title"], "impact": x["impact"],
-               "certainty": cert.get(x["status"], "EXPECTED"), "source_url": x["source_url"], "direction": x["direction"],
-               "why": x["why"]} for x in pdat.get("roadmap", [])]
-        proj_rows = build_roadmap({t: {"verified": (project or {}).get("verified"), "data": {"events": ev}}}, None, [t])
-        g = {"HIGH": 0.2, "MEDIUM": 0.0, "LOW": -0.2}.get(pdat.get("growth_view"), 0.0)
-        news_long = float(np.clip(event_net(proj_rows, t, 365) + g, -1, 1))
-        data["horizons"] = horizon_outlook(c, data["snaps"], c.get("event_net", 0.0), news_long, data.get("checks"))
-        rows = [{k: r.get(k) for k in ("date", "scope", "title", "direction", "impact", "certainty", "why")}
-                for r in roadmap + proj_rows if t in r["coins"] or not r["coins"]]
-        report, errs = focus_ai(cfg.client, cfg.model, coin_brief(c, research.get(t)), deep_brief(data), rows, pdat)
+        proj_rows, pdat, rows = deep_finish(c, data, project, roadmap)
+        report, errs = focus_ai(cfg.client, cfg.model, coin_brief(c, research.get(c["ticker"])), deep_brief(data), rows, pdat)
         errs = (project or {}).get("errors", []) + errs
+    return deep_pack(c, data, report, errs, project, proj_rows)
+
+
+def deep_pack(c: dict, data: dict, report, errs: list, project: dict | None, proj_rows: list) -> dict:
     ai = report.model_dump() if report else None
     hviews = enforce_horizon_views(ai.get("horizon_views", []), data["horizons"]) if ai else {}
-    return {"focus": t, "data": data, "ai": ai, "errors": errs, "project": project, "project_rows": proj_rows,
+    return {"focus": c["ticker"], "data": data, "ai": ai, "errors": errs, "project": project, "project_rows": proj_rows,
             "horizon_ai": hviews}
+
+
+def _safe(fut, default, what: str, errors: list[str]):
+    """รอผลจาก thread · ถ้าพังให้ใช้ค่า default แล้วบันทึก error (Agent ตัวเดียวล่มไม่ทำให้ทั้งระบบล่ม)"""
+    if fut is None:
+        return default
+    try:
+        return fut.result()
+    except Exception as e:  # noqa: BLE001
+        log.exception(what)
+        errors.append(f"{what}: {str(e)[:160]}")
+        return default
 
 
 # ───────────────────────── Full pipeline ─────────────────────────
 def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
                  bar: Callable[[float, str], None] | None = None) -> dict:
+    """ทั้งระบบ · งานที่ไม่ต้องรอกันจะรันพร้อมกัน (ThreadPool) — Agent ใน thread ห้ามแตะ UI (progress เรียกจาก main เท่านั้น)
+
+    ลำดับ: รายชื่อคู่เทรด → Scanner → [แท่งเทียน ‖ พื้นฐาน/F&G ‖ ข้อมูล Deep dive] → วิเคราะห์รายเหรียญ
+          → [ข่าว ‖ ปฏิทินอีเวนต์] → [Research ‖ โปรเจกต์ ‖ คำนวณ Deep dive] → Roadmap → [Strategist ‖ AI เจาะลึก]
+    """
     t0 = time.perf_counter()
+    timings: dict[str, float] = {}
+    bg_errors: list[str] = []
+    mark = [time.perf_counter()]
+
+    def lap(name: str) -> None:
+        now = time.perf_counter()
+        timings[name] = round(now - mark[0], 1)
+        mark[0] = now
+
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
+    try:
+        return _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> dict:
     progress("📡 Market Data Agent: ตรวจรายชื่อคู่เทรด…")
     valid = set(md.tickers().index)
     req = list(dict.fromkeys(cfg.watch))
@@ -1274,26 +1326,35 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     req = req[:cfg.max_watch]
     watch = [w for w in req if f"{w}{QUOTE}" in valid]
     missing = [w for w in req if f"{w}{QUOTE}" not in valid]
+    focus_t = watch[0] if watch else None
+    ai_on = bool(cfg.client and cfg.ai_agents)
+    # เริ่มดึงข้อมูล Deep dive ตั้งแต่ตอนนี้ (1H + คู่แข่ง) ระหว่างที่ Scanner ทำงาน
+    f_deep = pool.submit(deep_fetch, md, f"{focus_t}{QUOTE}", focus_t) if (cfg.deep and focus_t) else None
     scan = {"picks": [], "tags": {}, "info": {}, "xs_bt": None, "universe": 0, "dropped_spread": 0, "ref_risk_adj": []}
     if cfg.n_extra:
         progress("🔎 AI Market Scanner: จัดอันดับ Momentum เทียบตลาด + Trend + สัญญาณเทคนิค…")
         scan = scan_universe(md, set(watch) | {"BTC"}, cfg.n_extra, cfg.min_qvol, progress=bar)
+    lap("Scanner")
     extra, scan_tags = scan["picks"], scan["tags"]
     syms = list(dict.fromkeys([f"BTC{QUOTE}", *[f"{w}{QUOTE}" for w in watch], *extra]))
-    progress("📡 Market Data Agent: ดึง 4H/1D/1W แบบขนาน…")
+    tickers = tuple(s[: -len(QUOTE)] for s in syms)
+    # พื้นฐาน (CoinGecko/DefiLlama/RSS) + Fear & Greed ดึงพร้อมกับแท่งเทียน
+    f_ext = pool.submit(external_bundle, tickers, cfg.cg_key)
+    f_fng = pool.submit(fear_greed)
+    progress("📡 Market Data Agent: ดึง 4H/1D/1W + ข้อมูลพื้นฐาน (พร้อมกัน)…")
     frames = fetch_frames(md, syms, ("4h", "1d", "1w"), bar)
     if "1d" not in frames.get(f"BTC{QUOTE}", {}) or "1w" not in frames.get(f"BTC{QUOTE}", {}):
         raise RuntimeError("ดึงข้อมูล BTC ไม่ได้ — ระงับการวิเคราะห์ (ข้อมูลไม่เพียงพอ)")
 
     progress("🏛 Fundamental + Macro Agent…")
-    tickers = tuple(s[: -len(QUOTE)] for s in syms)
-    ext = external_bundle(tickers, cfg.cg_key)
+    ext = f_ext.result()
     cg, glob, llama, rss, det = ext["cg"], ext["glob"], ext["llama"], ext["rss"], ext["det"]
-    fng = fear_greed()
+    fng = _safe(f_fng, None, "Fear & Greed", bg_errors)
     btc_d = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1d"]))
     btc_w = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1w"]))
     macro = macro_agent(btc_d, btc_w, glob, fng)
     macro["btc_price"] = float(frames[f"BTC{QUOTE}"]["1d"]["close"].iloc[-1])
+    lap("ดึงข้อมูลตลาด")
 
     progress("📐 Structure + Quant + Forecast Agent…")
     coins, skipped = [], []
@@ -1314,10 +1375,16 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
             coins.append(c)
         else:
             skipped.append(f"{t}: ข้อมูลไม่พอ")
+    base = [c for c in coins if not c["is_pick"] and (c["ticker"] != "BTC" or "BTC" in cfg.watch)]
+    analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
+    lap("วิเคราะห์เทคนิค/สถิติ")
 
+    # ปฏิทินอีเวนต์ไม่ต้องรอข่าว → เริ่มเลย
+    f_cal = (pool.submit(macro_calendar_agent, cfg.client, cfg.model_research, [c["ticker"] for c in analyzed],
+                         cfg.research_cache) if ai_on else None)
     news = {"items": [], "src": {}, "report": {"overall": "", "themes": [], "coins": {}}, "mode": "off", "focus": []}
     if cfg.use_news and coins:
-        progress("📰 News Agent: ดึงข่าว 6 เว็บ + Google News รายเหรียญ…")
+        progress("📰 News Agent: ดึงข่าว 6 เว็บ + Google News รายเหรียญ" + (" (ปฏิทินอีเวนต์ค้นพร้อมกัน)…" if ai_on else "…"))
         try:
             hold = [h for h in cfg.holdings if h]
             names = {c["ticker"]: c["fund"].get("name") for c in coins if c["fund"].get("name")}
@@ -1332,10 +1399,11 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
             cfg.news_items = items
         except Exception as e:  # noqa: BLE001
             news["error"] = str(e)[:200]
+    lap("ข่าว")
+    # เรียงเหรียญจาก Scanner ใหม่ตามคะแนนหลังปรับด้วยข่าว (ลำดับเดียวกับเวอร์ชันก่อน)
+    analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
     d1s = {c["symbol"]: c["d1"] for c in coins}
     corr = corr_matrix(d1s)
-    base = [c for c in coins if not c["is_pick"] and (c["ticker"] != "BTC" or "BTC" in cfg.watch)]
-    analyzed = base + sorted([c for c in coins if c["is_pick"]], key=lambda c: c["score"], reverse=True)
 
     H = horizon_bucket(cfg.horizon)
     btc_reg = pd.Series(regime_arr(btc_d), index=btc_d.index)  # สภาพ BTC รายวัน ใช้ปรับเทียบตามภาวะตลาด
@@ -1348,7 +1416,6 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
         c["score_check"] = ck
         if ck is not None and ck["ok"] and c["p_up_h"] is not None:
             c["p_up_h"] = 0.5 * c["p_up_h"] + 0.5 * ck["p_today"]  # ปรับเทียบด้วยผลจริงในอดีต
-
     signals, watch_only = [], []
     for c in analyzed:
         sig, fails = build_signal(c, macro, c.get("news"), bool(c.get("news_block")))
@@ -1358,35 +1425,62 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
         elif c["med"]["status"] != "🔴":
             watch_only.append(c["ticker"])
 
+    fc_ = next((c for c in analyzed if focus_t and c["ticker"] == focus_t), None)
     research = {"by_ticker": {}, "log": []}
-    macro_cal = None
-    if cfg.client and cfg.ai_agents:
-        focus_c = [c for c in analyzed if watch and c["ticker"] == watch[0]]  # เหรียญที่เจาะลึกได้ Research เสมอ
+    f_res = f_proj = None
+    if ai_on:
+        focus_c = [fc_] if fc_ is not None else []  # เหรียญที่เจาะลึกได้ Research เสมอ
         short = focus_c + [c for c in sorted(analyzed, key=lambda c: c["score"], reverse=True) if c not in focus_c]
         short = short[: max(cfg.n_research, len(focus_c))]
-        research = research_agent(cfg.client, cfg.model_research, short, cfg.research_cache, progress,
-                                  news["items"], na.headlines,
-                                  lambda c: [f"{x['date']} {x['src']}: {x['title']}"
-                                             for x in rss_for(c["ticker"], c["fund"].get("name"), rss)])
-        progress("🗓 Event Calendar Agent: ค้นข่าว/อีเวนต์ 90 วันข้างหน้า…")
+        f_res = pool.submit(research_agent, cfg.client, cfg.model_research, short, cfg.research_cache, None,
+                            news["items"], na.headlines,
+                            lambda c: [f"{x['date']} {x['src']}: {x['title']}"
+                                       for x in rss_for(c["ticker"], c["fund"].get("name"), rss)])
+        if cfg.deep and fc_ is not None:
+            heads = na.headlines(cfg.news_items, fc_["ticker"], 8) if cfg.news_items else []
+            f_proj = pool.submit(project_deep_agent, cfg.client, cfg.model_research, fc_, cfg.research_cache, heads)
+        progress("📰 Research + 🗓 ปฏิทินอีเวนต์" + (f" + 🔬 โปรเจกต์ {fc_['ticker']}" if f_proj else "") +
+                 " — AI ค้นเว็บพร้อมกัน…")
+    # ระหว่างรอ AI ค้นเว็บ → คำนวณ Deep dive (หลายกรอบเวลา + Backtest 6 กลยุทธ์ + คู่แข่ง) ใน main thread
+    deep, ddata = None, None
+    if cfg.deep and fc_ is not None:
         try:
-            macro_cal = macro_calendar_agent(cfg.client, cfg.model_research, [c["ticker"] for c in analyzed],
-                                             cfg.research_cache)
-        except Exception as e:  # noqa: BLE001 — ปฏิทินล่มไม่ทำให้ทั้งระบบล่ม
-            macro_cal = {"events": [], "errors": [str(e)[:200]]}
+            ddata = deep_data(md, fc_, frames.get(fc_["symbol"], {}),
+                              _safe(f_deep, None, "ดึงข้อมูล Deep dive", bg_errors))
+        except Exception as e:  # noqa: BLE001 — Deep dive ล่มไม่ทำให้ผลหลักหาย
+            log.exception("deep dive")
+            deep = {"focus": fc_["ticker"], "data": None, "ai": None, "errors": [str(e)[:200]]}
+    if ai_on:
+        research = _safe(f_res, research, "Research Agent", bg_errors)
+        macro_cal = _safe(f_cal, {"events": [], "errors": []}, "Event Calendar Agent", bg_errors)
+    else:
+        macro_cal = None
+    project = _safe(f_proj, None, "Project Agent", bg_errors)
+    lap("AI ค้นเว็บ + Deep dive")
     roadmap = build_roadmap(research["by_ticker"], macro_cal, [c["ticker"] for c in analyzed])
     for c in analyzed:
         c["event_net"] = event_net(roadmap, c["ticker"], max(H, 30))
         c["buy_sys"] = buy_score_sys(c)
         c["read"] = market_read(c, cfg.horizon)  # ให้ AI ใช้หลักฐานเดียวกัน
 
-    if cfg.client and cfg.ai_agents:
+    # Strategist (ทุกเหรียญ) กับ AI เจาะลึก (เหรียญเดียว) ไม่ต้องรอกัน → รันพร้อมกัน
+    f_focus, proj_rows = None, []
+    if ddata is not None and ai_on:
+        proj_rows, pdat, rows = deep_finish(fc_, ddata, project, roadmap)
+        f_focus = pool.submit(focus_ai, cfg.client, cfg.model, coin_brief(fc_, research["by_ticker"].get(fc_["ticker"])),
+                              deep_brief(ddata), rows, pdat)
+    if ai_on:
+        progress("🧭 Strategist + 🔬 AI เจาะลึก — วิเคราะห์พร้อมกัน…")
         port = strategist_and_risk(cfg.client, cfg.model, analyzed, research["by_ticker"], macro, corr,
-                                   cfg.n_med, cfg.n_long, progress, cfg.horizon, scan.get("xs_bt"))
+                                   cfg.n_med, cfg.n_long, None, cfg.horizon, scan.get("xs_bt"))
     else:
         picks = fallback_strategy(analyzed, cfg.n_med, cfg.n_long)
         port = {"picks": picks, "cash": 100 - sum(p["alloc_final"] for p in picks), "strategist": None, "views": {},
                 "risk": None, "errors": [], "mode": "rule-based (ไม่มี API key)"}
+    if ddata is not None:
+        report, ferrs = _safe(f_focus, (None, []), "AI เจาะลึก", bg_errors)
+        deep = deep_pack(fc_, ddata, report, (project or {}).get("errors", []) + ferrs, project, proj_rows)
+    lap("AI สรุป")
     views = port.get("views") or {}
     for c in analyzed:  # คะแนน AI ถูกจำกัดให้อยู่ภายใน ±15 ของคะแนนระบบ
         v = views.get(c["ticker"]) or {}
@@ -1395,23 +1489,15 @@ def run_pipeline(md: MarketData, cfg: RunConfig, progress: Progress = _noop,
     for i, c in enumerate(sorted(analyzed, key=lambda c: -c["buy_final"])):  # อ่านสถานการณ์อีกครั้งด้วยคะแนนสุดท้าย
         c["read"] = market_read(c, cfg.horizon, rank=i + 1)
         c["read"]["ai_wait"] = (views.get(c["ticker"]) or {}).get("wait_plan", "")
-
-    deep = None
-    fc_ = next((c for c in analyzed if watch and c["ticker"] == watch[0]), None)
-    if cfg.deep and fc_ is not None:
-        progress(f"🔬 Deep Dive {fc_['ticker']}: 1H-1W · Backtest 6 กลยุทธ์ · เทียบคู่แข่ง…")
-        try:
-            deep = run_deep(md, cfg, fc_, frames.get(fc_["symbol"], {}), research["by_ticker"], roadmap)
-        except Exception as e:  # noqa: BLE001 — Deep dive ล่มไม่ทำให้ผลหลักหาย
-            log.exception("deep dive")
-            deep = {"focus": fc_["ticker"], "data": None, "ai": None, "errors": [str(e)[:200]]}
+    if bg_errors:
+        port["errors"] = list(port.get("errors") or []) + bg_errors
 
     return {"coins": analyzed, "macro": macro, "glob": glob, "fng": fng, "corr": corr, "research": research,
             "port": port, "missing": missing, "skipped": skipped, "rss": rss, "news": news,
             "signals": signals, "watch_only": watch_only, "watch_dropped": watch_dropped,
             "scan": {k: scan[k] for k in ("xs_bt", "universe", "dropped_spread")},
             "roadmap": roadmap, "macro_cal": macro_cal, "horizon": cfg.horizon, "deep": deep,
-            "ai_on": bool(cfg.client and cfg.ai_agents), "ai_models": list(_ai_models()),
+            "ai_on": ai_on, "ai_models": list(_ai_models()), "timings": timings,
             "elapsed": time.perf_counter() - t0, "btc_d": btc_d, "ts": datetime.now(TZ_TH), "host": md.host}
 
 
