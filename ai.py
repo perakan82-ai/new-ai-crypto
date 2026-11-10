@@ -10,7 +10,8 @@ import time
 from datetime import datetime
 from pydantic import BaseModel, ValidationError
 from typing import Callable, Literal
-from config import AUTO_MODEL, MAJORS, MODEL_FALLBACK, QUOTE, REG_TH, RESEARCH_TTL, TZ_TH
+from config import (AI_BUDGET_S, AI_MAX_MODELS, AI_TIMEOUT_S, AUTO_MODEL, MAJORS, MODEL_FALLBACK, QUOTE, REG_TH,
+                    RESEARCH_TTL, TZ_TH)
 from analysis import cap_for, rel_win
 
 
@@ -159,13 +160,19 @@ def make_client(api_key: str):
     """คืน client หรือ None (ไม่มี key / ไม่มีไลบรารี) · ค้นหาโมเดลที่ใช้ได้ครั้งเดียวต่อโปรเซส"""
     if not api_key or genai is None:
         return None
-    client = genai.Client(api_key=api_key)
+    try:  # จำกัดเวลารอต่อครั้ง — กันแอปค้างเมื่อ Gemini ตอบช้า (timeout หน่วย ms)
+        client = genai.Client(api_key=api_key, http_options=gtypes.HttpOptions(timeout=AI_TIMEOUT_S * 1000))
+    except Exception:  # noqa: BLE001 — google-genai รุ่นเก่าที่ไม่รองรับ http_options
+        client = genai.Client(api_key=api_key)
     if not _DISCOVERED:
         _DISCOVERED.extend(discover_models(client))
     return client
 
 
-def _retry(fn, tries: int = 3):
+_TIMEOUT_MSG = ("timed out", "timeout", "Timeout", "DEADLINE_EXCEEDED", "ReadTimeout")
+
+
+def _retry(fn, tries: int = 2):
     for i in range(tries):
         try:
             return fn()
@@ -206,11 +213,15 @@ def _sources(resp) -> list[dict]:
 def model_chain(primary: str) -> list[str]:
     """โมเดลที่เลือก → โมเดลที่ค้นเจอว่าใช้ได้จริง (ใหม่สุดก่อน) → alias -latest"""
     base = [] if (not primary or primary == AUTO_MODEL) else [primary]
-    return list(dict.fromkeys(base + _DISCOVERED[:4] + MODEL_FALLBACK))
+    chain = list(dict.fromkeys(base + _DISCOVERED[:4] + MODEL_FALLBACK))
+    # จำกัดจำนวนโมเดลที่ลอง (ประหยัดเวลา) แต่เก็บ alias ที่เสถียรที่สุดไว้เป็นตัวสุดท้ายเสมอ
+    return list(dict.fromkeys(chain[: AI_MAX_MODELS - 1] + [MODEL_FALLBACK[0]]))
 
 
-def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search: bool):
-    """Model fallback × Mode fallback (schema+search → search+parse → schema) · คืน (obj|None, sources, mode, errors)"""
+def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search: bool,
+                budget_s: float = AI_BUDGET_S):
+    """Model fallback × Mode fallback (schema+search → search+parse → schema) · คืน (obj|None, sources, mode, errors)
+    หยุดลองเมื่อใช้เวลารวมเกิน budget_s · ถ้าโมเดลไหน timeout → ข้ามไปโมเดลถัดไปทันที (ไม่ลองโหมดอื่นของโมเดลเดิม)"""
     if client is None or gtypes is None:
         return None, [], "no-client", []
     prompt += "\n\nตอบเป็น JSON ตาม schema นี้เท่านั้น:\n" + json.dumps(schema.model_json_schema(), ensure_ascii=False)
@@ -221,8 +232,12 @@ def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search
                   ("search+parse", dict(tools=tool))]
     modes.append(("schema", dict(response_mime_type="application/json", response_schema=schema)))
     errs: list[str] = []
+    deadline = time.monotonic() + budget_s
     for m in model_chain(model):
         for name, kw in modes:
+            if time.monotonic() > deadline:
+                errs.append(f"หมดเวลา {budget_s:.0f}s — ใช้ผลแบบ rule-based แทน")
+                return None, [], "timeout", errs
             try:
                 cfg = gtypes.GenerateContentConfig(temperature=0.2, **kw)
                 resp = _retry(lambda: client.models.generate_content(model=m, contents=prompt, config=cfg))
@@ -234,7 +249,7 @@ def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search
                 errs.append(f"{m}:{name}: {msg[:110]}")
                 if "API key" in msg or "PERMISSION_DENIED" in msg:
                     return None, [], "failed", errs
-                if any(k in msg for k in _SKIP_MODEL):
+                if any(k in msg for k in _SKIP_MODEL) or any(k in msg for k in _TIMEOUT_MSG):
                     break
     return None, [], "failed", errs
 
@@ -593,7 +608,6 @@ def strategist_and_risk(client, model, coins, research, macro, corr, n_med, n_lo
                         progress: Progress | None = None, horizon: int = 30, xs_bt: dict | None = None) -> dict:
     coins_by = {c["ticker"]: c for c in coins}
     briefs = [coin_brief(c, research.get(c["ticker"])) for c in coins]
-    bmap = {b["ticker"]: b for b in briefs}
     if progress:
         progress("🧭 Strategist Agent: วิเคราะห์ + จัดพอร์ต…")
     sp = f"""คุณคือ Chief Strategist ระดับสถาบัน (Spot only) ทำงานร่วมกับ Agent อื่นที่คำนวณตัวเลขมาแล้ว
@@ -640,26 +654,64 @@ upcoming_news_net = ผลรวมข่าว/อีเวนต์ข้า�
     picks = enforce_strategy(so, coins_by, n_med, n_long)
     views = {v.ticker.upper().replace(QUOTE, ""): v.model_dump() for v in so.coin_views}
 
-    if progress:
-        progress("🛡️ Risk Manager Agent: ตรวจพอร์ต…")
-    tick = [p["ticker"] for p in picks]
-    sub = (corr.loc[[t for t in tick if t in corr.index], [t for t in tick if t in corr.columns]]
-           if len(corr) else pd.DataFrame())
-    rp = f"""คุณคือ Risk Manager Agent ตรวจพอร์ต Spot นี้: {json.dumps(picks, ensure_ascii=False, default=str)}
-Correlation 90D: {sub.to_json() if len(sub) else "{}"}
-Risk ต่อเหรียญ: {json.dumps({t: bmap[t]['risk'] for t in set(tick)}, default=str)}
-สถิติแผนระยะกลาง: {json.dumps({t: {k: bmap[t]['medium'][k] for k in ('p_tp1_before_sl', 'breakeven_win', 'expectancy_R', 'oos_expectancy_R')} for t in set(tick)}, default=str)}
-MACRO regime: {macro['regime']}
-ตรวจการกระจุกตัว, correlation > 0.8, beta สูง, เหรียญที่ edge ต่ำ แล้วให้ verdict APPROVE/CAUTION/REJECT
-adjustments: ใส่ทุกรายการ (ticker, horizon) allocation_pct ต้อง ≤ ค่าเดิม (ลดได้อย่างเดียว) win_rate ปรับได้ ±10 จาก win_sys · เขียนภาษาไทย"""
-    ro, _, mode_r, err_r = gemini_json(client, model, rp, RiskOut, search=False)
-    if ro:
-        picks = enforce_risk(ro, picks)
-    else:
-        for p in picks:
-            p.update(alloc_final=p["alloc"], win_final=p["win_strat"], risk_note="")
+    picks, ro = risk_rules(picks, coins_by, corr, macro)
     return {"picks": picks, "cash": max(0.0, 100 - sum(p["alloc_final"] for p in picks)), "strategist": so,
-            "views": views, "risk": ro, "errors": err_s + err_r, "mode": f"{mode_s} / {mode_r if ro else 'fail'}"}
+            "views": views, "risk": ro, "errors": err_s, "mode": f"{mode_s} / risk: rule-based"}
+
+
+def risk_rules(picks: list[dict], coins_by: dict, corr: pd.DataFrame, macro: dict) -> tuple[list[dict], RiskOut]:
+    """Risk Manager แบบกติกา (แทนการเรียก AI รอบที่ 2 — เร็วกว่า ตรวจสอบได้ ผลเหมือนเดิมทุกครั้ง)
+
+    ลด allocation ได้อย่างเดียว:
+      1) คู่ที่ correlation 90D > 0.8 → ตัวที่คะแนนต่ำกว่าลด 30% (เสี่ยงซ้ำซ้อน)
+      2) altcoin beta > 1.5 → ลด 25%
+      3) ระยะกลางที่ backtest ช่วงล่าสุด (OOS) ติดลบ → ลด 50%
+      4) Macro Bear → เงินลงทุนรวมไม่เกิน 60% (ที่เหลือเป็นเงินสด)
+    win rate คงตามที่ Strategist ปรับ (อยู่ในกรอบ ±10 ของระบบอยู่แล้ว)
+    """
+    issues: list[str] = []
+    notes: dict[tuple[str, str], list[str]] = {}
+    mult = {(p["ticker"], p["horizon"]): 1.0 for p in picks}
+
+    def cut(key, f, why):
+        mult[key] *= f
+        notes.setdefault(key, []).append(why)
+
+    tick = list(dict.fromkeys(p["ticker"] for p in picks))
+    for i, a in enumerate(tick):
+        for b in tick[i + 1:]:
+            if len(corr) and a in corr.index and b in corr.columns:
+                v = corr.loc[a, b]
+                if pd.notna(v) and v > 0.8:
+                    lo = min((a, b), key=lambda t: coins_by[t]["score"])
+                    issues.append(f"{a} กับ {b} เคลื่อนไหวเหมือนกันมาก (corr {v:.2f}) → ลด {lo} 30%")
+                    for p in picks:
+                        if p["ticker"] == lo:
+                            cut((lo, p["horizon"]), 0.7, f"corr กับ {a if lo == b else b} {v:.2f}")
+    for p in picks:
+        c, key = coins_by[p["ticker"]], (p["ticker"], p["horizon"])
+        beta = c["risk"].get("beta")
+        if p["ticker"] not in MAJORS and beta is not None and np.isfinite(beta) and beta > 1.5:
+            issues.append(f"{p['ticker']} beta {beta:.2f} (แกว่งแรงกว่า BTC) → ลด 25%")
+            cut(key, 0.75, f"beta {beta:.2f}")
+        oos = c["bt"].get("oos_expectancy")
+        if p["horizon"] == "MEDIUM" and c["bt"].get("oos_n", 0) >= 3 and oos is not None and oos < 0:
+            issues.append(f"{p['ticker']} backtest ช่วงล่าสุดติดลบ ({oos:+.2f}R) → ลดระยะกลาง 50%")
+            cut(key, 0.5, f"OOS {oos:+.2f}R")
+    for p in picks:
+        key = (p["ticker"], p["horizon"])
+        p["alloc_final"] = p["alloc"] * mult[key]
+        p["win_final"] = float(np.clip(p["win_strat"], p["win_sys"] - 10, p["win_sys"] + 10))
+        p["risk_note"] = " · ".join(notes.get(key, []))
+    tot = sum(p["alloc_final"] for p in picks)
+    if macro.get("regime") == "Bear" and tot > 60:
+        issues.append(f"ตลาดขาลง (Macro Bear) → จำกัดเงินลงทุนรวม 60% จาก {tot:.0f}%")
+        for p in picks:
+            p["alloc_final"] *= 60 / tot
+    verdict = "APPROVE" if not issues else "CAUTION"
+    final = ("ผ่านเกณฑ์ความเสี่ยงทั้งหมด" if not issues else
+             f"ปรับลดสัดส่วน {len(issues)} จุด · เงินลงทุนรวม {sum(p['alloc_final'] for p in picks):.0f}%")
+    return picks, RiskOut(verdict=verdict, issues=issues, adjustments=[], final_note=final)
 
 
 def explain_signals(client, model: str, items: list[tuple[dict, object]]) -> dict[str, str]:
