@@ -756,3 +756,75 @@ def test_score_check_macro_condition(daily):
     ck = score_check(d, 30, macro=mac)
     assert ck["macro_up"] is not None and ck["macro_up"]["state"] == mac[-1]
     assert 0 <= ck["p_today"] <= 1
+
+
+# ════════════════════ ความเร็ว: Agent รันพร้อมกัน + Risk แบบกติกา ════════════════════
+def test_pipeline_ai_agents_run_in_parallel(monkeypatch):
+    """จำลอง Gemini ที่ตอบช้า 0.6 วินาทีต่อครั้ง — ถ้ารันเรียงกันจะใช้ ≥ 3 วินาที (5 Agent) · แบบขนานควรเหลือ ~1.2 วินาที"""
+    import time as _t
+    import ai
+    import pipeline as pl
+    calls = []
+
+    def slow(client, model, prompt, schema, search, budget_s=180):
+        calls.append(schema.__name__)
+        _t.sleep(0.6)
+        return None, [], "failed", ["จำลอง: ไม่มีคำตอบ"]
+    monkeypatch.setattr(ai, "gemini_json", slow)
+    cfg = pl.RunConfig(watch=["SOL"], n_extra=2, use_news=False, client=object(), n_research=2)
+    res = pl.run_pipeline(FakeMarketWide(), cfg)
+    assert {"ResearchBatch", "MacroCalendar", "ProjectDeep", "StrategistOut", "FocusReport"} <= set(calls)
+    assert "RiskOut" not in calls                     # Risk Manager ไม่เรียก AI แล้ว
+    ai_time = res["timings"]["AI ค้นเว็บ + Deep dive"] + res["timings"]["AI สรุป"]
+    assert ai_time < 0.6 * 5 - 0.5, res["timings"]    # เร็วกว่ารันเรียงกันชัดเจน
+    assert res["deep"]["focus"] == "SOL" and res["deep"]["data"] is not None
+    assert res["port"]["mode"].startswith("fallback")  # AI ล่ม → ระบบยังให้ผลแบบ rule-based
+
+
+def test_risk_rules_only_reduce():
+    from ai import risk_rules
+    coins = {"SOL": {"score": 70, "risk": {"beta": 1.8}, "bt": {"oos_n": 5, "oos_expectancy": -0.3}},
+             "AVAX": {"score": 50, "risk": {"beta": 1.2}, "bt": {"oos_n": 5, "oos_expectancy": 0.2}},
+             "BTC": {"score": 60, "risk": {"beta": 1.0}, "bt": {"oos_n": 5, "oos_expectancy": 0.1}}}
+    corr = pd.DataFrame([[1, .9, .5], [.9, 1, .5], [.5, .5, 1]], index=list(coins), columns=list(coins))
+    picks = [{"ticker": t, "horizon": h, "alloc": a, "win_sys": 55.0, "win_strat": 70.0}
+             for t, h, a in (("SOL", "MEDIUM", 10.0), ("AVAX", "LONG", 10.0), ("BTC", "LONG", 30.0))]
+    out, ro = risk_rules(picks, coins, corr, {"regime": "Bear"})
+    by = {p["ticker"]: p for p in out}
+    assert by["SOL"]["alloc_final"] == pytest.approx(10 * 0.75 * 0.5)   # beta สูง + OOS ติดลบ
+    assert by["AVAX"]["alloc_final"] == pytest.approx(7.0)               # corr 0.9 กับ SOL และคะแนนต่ำกว่า
+    assert by["BTC"]["alloc_final"] == pytest.approx(30.0)
+    assert all(p["alloc_final"] <= p["alloc"] for p in out)
+    assert all(p["win_final"] == 65.0 for p in out)                      # จำกัดไม่เกิน ±10 จากระบบ
+    assert ro.verdict == "CAUTION" and len(ro.issues) == 3
+    big = [{"ticker": "BTC", "horizon": "LONG", "alloc": 35.0, "win_sys": 50.0, "win_strat": 50.0},
+           {"ticker": "AVAX", "horizon": "LONG", "alloc": 35.0, "win_sys": 50.0, "win_strat": 50.0}]
+    out, ro = risk_rules(big, coins, pd.DataFrame(), {"regime": "Bear"})
+    assert sum(p["alloc_final"] for p in out) == pytest.approx(60.0)     # Macro Bear → ลงทุนรวม ≤ 60%
+
+
+def test_gemini_budget_stops_retrying(monkeypatch):
+    """โมเดลที่ timeout ต้องข้ามไปโมเดลถัดไปทันที และหยุดเมื่อหมดเวลารวม"""
+    import ai
+
+    class Cfg:
+        def __init__(self, **k):
+            pass
+
+    class T:
+        GenerateContentConfig = Cfg
+        Tool = GoogleSearch = Cfg
+    monkeypatch.setattr(ai, "gtypes", T)
+    tried = []
+
+    class Models:
+        def generate_content(self, model, contents, config):
+            tried.append(model)
+            raise RuntimeError("The read operation timed out")
+
+    class C:
+        models = Models()
+    out, _, mode, errs = ai.gemini_json(C(), "gemini-pro-latest", "x", ai.SignalNotes, search=True)
+    assert out is None and len(tried) == len(set(tried)) == len(ai.model_chain("gemini-pro-latest")) <= ai.AI_MAX_MODELS
+    out, _, mode, errs = ai.gemini_json(C(), "gemini-pro-latest", "x", ai.SignalNotes, search=True, budget_s=-1)
+    assert mode == "timeout" and "หมดเวลา" in errs[-1]
