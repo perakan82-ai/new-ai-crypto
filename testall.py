@@ -828,3 +828,27 @@ def test_gemini_budget_stops_retrying(monkeypatch):
     assert out is None and len(tried) == len(set(tried)) == len(ai.model_chain("gemini-pro-latest")) <= ai.AI_MAX_MODELS
     out, _, mode, errs = ai.gemini_json(C(), "gemini-pro-latest", "x", ai.SignalNotes, search=True, budget_s=-1)
     assert mode == "timeout" and "หมดเวลา" in errs[-1]
+
+
+# ───────────── v6.5: การ์ดโอกาสขึ้น/ลง ─────────────
+def test_prob_cards_fields_and_html():
+    from deep import reliability
+    from pipeline import RunConfig, run_pipeline
+    res = run_pipeline(FakeMarketWide(), RunConfig(watch=["SOL"], n_extra=0, use_news=False))
+    hz = res["deep"]["data"]["horizons"]
+    for h in hz:
+        if h["p_up"] is None:
+            continue
+        assert abs(h["p_up"] + h["p_dn"] - 1) < 1e-9
+        assert h["ret_lo"] <= h["ret_mid"] <= h["ret_hi"]
+        if h["move_up"] is not None:
+            assert h["move_up"] > 0
+        if h["move_dn"] is not None:
+            assert h["move_dn"] < 0
+        if h["ev"] is not None:
+            assert h["move_dn"] <= h["ev"] <= h["move_up"]
+        assert h["rel_level"] in ("ok", "warn", "bad", "info") and h["reliability"]
+    assert reliability(None, 5)[1] == "warn" and reliability(None, 100)[1] == "info"
+    assert reliability({"ok": True, "verdict": "✅"}, 50)[1] == "ok"
+    assert reliability({"ok": True, "verdict": "✅"}, 10)[1] == "warn"
+    assert reliability({"ok": False, "verdict": "🔴 x"}, 50)[1] == "bad"
