@@ -524,6 +524,49 @@ def ai_problem(res: dict) -> str | None:
     return None
 
 
+REL_STYLE = {"ok": ("rgba(22,163,74,.18)", "#16a34a"), "warn": ("rgba(217,119,6,.18)", "#d97706"),
+             "bad": ("rgba(220,38,38,.18)", "#dc2626"), "info": ("rgba(148,163,184,.18)", "#94a3b8")}
+
+
+def _pc(x) -> str:
+    return "-" if x is None else f"{x * 100:+.1f}%"
+
+
+def prob_cards_html(hz: list[dict], labels: tuple[str, ...] = ("1 วัน", "1 สัปดาห์", "1 เดือน", "3 เดือน")) -> str:
+    """การ์ดโอกาสขึ้น/ลงรายช่วงเวลา: แถบขึ้น-ลง % · กรอบราคา 50% กลาง · ถ้าขึ้น/ถ้าลง ปกติกี่ % · ป้ายความน่าเชื่อถือ"""
+    cards = []
+    for h in hz:
+        if h["label"] not in labels or h.get("p_up") is None:
+            continue
+        up = int(round(h["p_up"] * 100))
+        bg, fg = REL_STYLE.get(h.get("rel_level", "info"), REL_STYLE["info"])
+        ev = h.get("ev")
+        ev_txt = f" · ค่าคาดหวัง <b style='color:{'#16a34a' if ev > 0 else '#dc2626'}'>{_pc(ev)}</b>" if ev is not None else ""
+        cards.append(f"""<div style="border:1px solid rgba(148,163,184,.35);border-radius:12px;padding:10px 12px;margin-bottom:8px">
+<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+<span style="font-weight:600;font-size:15px">{h['label']} · {h['direction']}</span>
+<span style="font-size:12px;padding:2px 8px;border-radius:8px;background:{bg};color:{fg}">{h.get('reliability', '')}</span></div>
+<div style="display:flex;height:24px;border-radius:6px;overflow:hidden;margin:8px 0 6px;font-size:13px;font-weight:600">
+<div style="width:{max(up, 12)}%;background:rgba(22,163,74,.85);color:#fff;display:flex;align-items:center;padding-left:6px">ขึ้น {up}%</div>
+<div style="flex:1;background:rgba(220,38,38,.85);color:#fff;display:flex;align-items:center;justify-content:flex-end;padding-right:6px">ลง {100 - up}%</div></div>
+<div style="font-size:13px;line-height:1.6;opacity:.9">กรอบราคา 50% กลาง: <b>{_pc(h.get('ret_lo'))}</b> ถึง <b>{_pc(h.get('ret_hi'))}</b>
+({fp(h['lo'])} – {fp(h['hi'])})<br>ถ้าขึ้น ปกติ <b style="color:#16a34a">{_pc(h.get('move_up'))}</b> · ถ้าลง ปกติ
+<b style="color:#dc2626">{_pc(h.get('move_dn'))}</b>{ev_txt}</div></div>""")
+    return "\n".join(cards)
+
+
+def render_prob_cards(dp: dict):
+    hz = (dp.get("data") or {}).get("horizons") or []
+    html = prob_cards_html(hz)
+    if not html:
+        return
+    st.markdown(f"#### 🎲 โอกาสขึ้น / ลง ของ {dp['focus']} แต่ละช่วงเวลา")
+    st.markdown(html, unsafe_allow_html=True)
+    st.caption("โอกาสและกรอบราคามาจากสถิติของเหรียญนี้ในสภาพตลาดคล้ายวันนี้ (ปรับตามความผันผวนปัจจุบัน) · "
+               "\"ถ้าขึ้น/ถ้าลง ปกติ\" = ค่ากลางของการขยับในอดีต · ค่าคาดหวัง = โอกาสขึ้น × ขึ้นปกติ + โอกาสลง × ลงปกติ "
+               "(ก่อนหักค่าธรรมเนียม) · ป้าย ✅ = เทคนิคทำนายเหรียญนี้ได้ดีกว่าการเดาในช่วงทดสอบ · ไม่ใช่การรับประกันผล")
+
+
 def render_home(res: dict, capital: float, risk_pct: float):
     """หน้าแรก: คำตอบเดียว ซื้อ / รอ / เลี่ยง + เหตุผล + ทิศทางแต่ละช่วงเวลา + แผน + ความแม่นที่ทดสอบแล้ว"""
     dp = res.get("deep") or {}
@@ -542,6 +585,7 @@ def render_home(res: dict, capital: float, risk_pct: float):
     k[1].metric(f"โอกาสขึ้นใน {horizon_bucket(res.get('horizon', 30))} วัน", fprob(v["p_up"]),
                 "ปรับเทียบกับผลจริงแล้ว" if ck.get("ok") else "สถิติย้อนหลัง")
     k[2].metric("มุมมอง", outlook_label(c))
+    render_prob_cards(dp)
     ai = dp.get("ai") or {}
     if ai.get("thesis"):
         st.info(f"🧠 **AI สรุป:** {ai['thesis']}")
@@ -566,7 +610,8 @@ def render_home(res: dict, capital: float, risk_pct: float):
         st.caption("🧪 " + v["accuracy"])
     render_fundamentals(dp, c, compact=True)
     if dp.get("data"):
-        render_horizons(dp, c, show_signals=False)
+        with st.expander("🧭 คะแนนทิศทางแต่ละช่วงเวลา (ตาราง + 1 ปี)"):
+            render_horizons(dp, c, show_signals=False)
     st.markdown("#### 📋 แผนเข้า-ออก")
     st.dataframe(trade_plan_table([c], res["ts"]), use_container_width=True, hide_index=True)
     checks = list(((dp.get("data") or {}).get("checks") or {}).values())
