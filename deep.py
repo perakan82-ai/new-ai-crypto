@@ -334,11 +334,14 @@ def horizon_outlook(c: dict, snaps: list[dict], news_short: float, news_long: fl
     out = []
     for label, H, tfs in HZ:
         S = _fc_samples(c, H)
-        p_up, n_eff, q = None, 0, None
+        p_up, n_eff, q, mv_up, mv_dn = None, 0, None, None, None
         if S is not None:
             n_eff = S["n_eff"]
-            p_up = laplace(float((S["end"] > 0).mean()), n_eff)
-            q = np.quantile(S["end"], [0.25, 0.5, 0.75])
+            end = S["end"]
+            p_up = laplace(float((end > 0).mean()), n_eff)
+            q = np.quantile(end, [0.25, 0.5, 0.75])
+            mv_up = float(np.median(end[end > 0])) if (end > 0).sum() >= 5 else None  # ถ้าขึ้น ปกติขึ้นเท่าไร
+            mv_dn = float(np.median(end[end < 0])) if (end < 0).sum() >= 5 else None  # ถ้าลง ปกติลงเท่าไร
         ts = [tech_by[t] for t in tfs if t in tech_by]
         tech = float(np.mean(ts)) if ts else 50.0
         news = news_short if H <= 30 else (0.5 * news_short + 0.5 * news_long if H <= 90 else news_long)
@@ -361,13 +364,34 @@ def horizon_outlook(c: dict, snaps: list[dict], news_short: float, news_long: fl
         else:
             direction = "⚪ ไซด์เวย์/ไม่ชัด"
         conf = "สูง" if n_eff >= 30 and agree else ("กลาง" if n_eff >= 12 and agree else "ต่ำ")
+        rel, rel_lv = reliability(ck, n_eff)
+        ev = (p_up * mv_up + (1 - p_up) * mv_dn) if (p_up is not None and mv_up is not None and mv_dn is not None) else None
         out.append({"label": label, "H": H, "score": float(np.clip(score, 0, 100)), "p_up": p_up, "tech": tech,
                     "tested": (ck["verdict"].split(" ")[0] if ck else "—"), "w_tech": w_tech,
                     "news": news, "direction": direction, "confidence": conf, "n_eff": n_eff,
                     "lo": c["price"] * (1 + q[0]) if q is not None else None,
                     "mid": c["price"] * (1 + q[1]) if q is not None else None,
-                    "hi": c["price"] * (1 + q[2]) if q is not None else None})
+                    "hi": c["price"] * (1 + q[2]) if q is not None else None,
+                    "p_dn": (1 - p_up) if p_up is not None else None,
+                    "ret_lo": float(q[0]) if q is not None else None, "ret_mid": float(q[1]) if q is not None else None,
+                    "ret_hi": float(q[2]) if q is not None else None, "move_up": mv_up, "move_dn": mv_dn, "ev": ev,
+                    "reliability": rel, "rel_level": rel_lv})
     return out
+
+
+def reliability(ck: dict | None, n_eff: int) -> tuple[str, str]:
+    """ป้ายความน่าเชื่อถือของตัวเลขโอกาส: ok / warn / bad / info (บอกตรงๆ ว่าผ่านการทดสอบย้อนหลังหรือยัง)"""
+    if ck is not None:
+        if ck["ok"]:
+            if n_eff < 30:
+                return f"✅ ทดสอบผ่าน แต่ตัวอย่างน้อย (n={n_eff})", "warn"
+            return f"✅ ทดสอบย้อนหลังผ่าน (n={n_eff})", "ok"
+        if ck["verdict"].startswith("🔴"):
+            return f"🔴 ทดสอบแล้วทำนายไม่ได้ ใช้สถิติพื้นฐาน (n={n_eff})", "bad"
+        return f"🟡 ทดสอบแล้วทำนายได้อ่อน (n={n_eff})", "warn"
+    if n_eff < 30:
+        return f"⚠️ ตัวอย่างน้อย ใช้ประกอบเท่านั้น (n={n_eff})", "warn"
+    return f"⚪ สถิติย้อนหลัง ยังไม่ได้ทดสอบ (n={n_eff})", "info"
 
 
 def horizon_table(hz: list[dict], ai_views: dict | None = None) -> pd.DataFrame:
@@ -381,6 +405,9 @@ def horizon_table(hz: list[dict], ai_views: dict | None = None) -> pd.DataFrame:
                      "เทคนิค": f"{h['tech']:.0f}/100", "ทดสอบย้อนหลัง": h.get("tested", "—"),
                      "ข่าว/โรดแมป": f"{h['news']:+.2f}",
                      "กรอบราคา (50% กลาง)": f"{fp(h['lo'])} – {fp(h['hi'])}" if h["lo"] else "-",
+                     "ถ้าขึ้น / ถ้าลง ปกติ": (f"{h['move_up'] * 100:+.1f}% / {h['move_dn'] * 100:+.1f}%"
+                                            if h.get("move_up") is not None and h.get("move_dn") is not None else "-"),
+                     "ความน่าเชื่อถือ": h.get("reliability", "-"),
                      "ความมั่นใจ": f"{h['confidence']} (n={h['n_eff']})", "AI ให้เหตุผล": v.get("reason", "-")})
     return pd.DataFrame(rows)
 
@@ -545,7 +572,10 @@ def deep_brief(deep: dict) -> dict:
         "best_strategy": lab["best"]["name"] if lab["best"] else None, "strategy_verdict": lab["verdict"],
         "horizons": [{"horizon": h["label"], "system_score": round(h["score"]), "direction": h["direction"],
                       "p_up": h["p_up"] and round(h["p_up"], 2), "tech": round(h["tech"]), "confidence": h["confidence"],
-                      "n": h["n_eff"], "range_p25_p75": [h["lo"] and round(h["lo"], 6), h["hi"] and round(h["hi"], 6)]}
+                      "n": h["n_eff"], "range_p25_p75": [h["lo"] and round(h["lo"], 6), h["hi"] and round(h["hi"], 6)],
+                      "typical_move_if_up": h.get("move_up") and round(h["move_up"], 3),
+                      "typical_move_if_down": h.get("move_dn") and round(h["move_dn"], 3),
+                      "expected_move": h.get("ev") and round(h["ev"], 3), "reliability": h.get("reliability")}
                      for h in deep.get("horizons", [])],
         "score_backtest": {f"{H}d": {"verdict": ck["verdict"], "skill": round(ck["skill"], 3), "hit": ck["hit"],
                                      "p_up_calibrated": round(ck["p_today"], 2), "n_similar": ck["n_today"]}
