@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "6.5.0"
+__version__ = "6.6.0"
 
 import functools
 import numpy as np
@@ -85,8 +85,10 @@ AUTO_MODEL = "อัตโนมัติ (แนะนำ)"  # ถาม Google
 GEMINI_MODELS = [AUTO_MODEL, "gemini-flash-latest", "gemini-pro-latest", "gemini-flash-lite-latest"]
 MODEL_FALLBACK = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"]  # alias ที่ Google ชี้ไปรุ่นล่าสุดเสมอ
 RESEARCH_TTL = 6 * 3600
-AI_TIMEOUT_S = 90      # รอ Gemini ต่อครั้งสูงสุด (วินาที) · เกินนี้ถือว่าล่ม แล้วลองโมเดลถัดไป
-AI_BUDGET_S = 180      # เวลารวมสูงสุดต่อ 1 Agent (รวมทุกการลองซ้ำ) · หมดเวลา → ใช้ผลแบบ rule-based
+AI_TIMEOUT_S = 45      # รอ Gemini ต่อครั้งสูงสุด (วินาที) · เกินนี้ถือว่าล่ม แล้วลองโมเดลถัดไป (v6.5: 90 → 45)
+AI_BUDGET_S = 75       # เวลารวมสูงสุดต่อ 1 Agent (รวมทุกการลองซ้ำ) · หมดเวลา → ใช้ผลแบบ rule-based (v6.5: 180 → 75)
+MAX_RESEARCH = 4        # AI Research ค้นเว็บไม่เกิน 4 เหรียญ/รอบ (= 1 ครั้ง) กันโควต้า Gemini ฟรีหมด
+RESULT_TTL_S = 15 * 60  # ผลวิเคราะห์ล่าสุดเก็บไว้ใช้ซ้ำ (เปิดแอปใหม่/รีเฟรช/กดซ้ำด้วยค่าเดิม → แสดงทันที)
 AI_MAX_MODELS = 3      # ลองโมเดลสำรองไม่เกินกี่ตัว (เดิมไล่ได้ถึง 7 ตัว × 3 โหมด)
 
 CG_BASE = "https://api.coingecko.com/api/v3"
