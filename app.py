@@ -18,8 +18,10 @@ Secrets (Streamlit Cloud → App settings → Secrets):
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
+
 import pandas as pd
 import streamlit as st
 
@@ -27,7 +29,7 @@ import sources as na
 from ai import make_client
 from analysis import cap_for
 from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
-                    SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, __version__, dist, fbig, fp, fpct, fprob)
+                    SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, MAX_RESEARCH, RESULT_TTL_S, __version__, dist, fbig, fp, fpct, fprob)
 from market import MarketData
 from deep import check_table, horizon_table, mtf_table, peer_table, signals_table, strategy_table
 from pipeline import (DIR_EMO, downside_plan, final_verdict, outlook_label, PF_ACT, PF_SEV, PF_SLOTS, RunConfig, analysis_export_df, decision_table, deep_dive_md,
@@ -41,12 +43,34 @@ try:
 except ImportError:
     go = None
 
+CHART_DAYS = 180  # กราฟแสดงย้อนหลัง 6 เดือน (เดิม 220 วัน + เส้นเยอะ)
 HORIZONS = {"7 วัน": 7, "14 วัน": 14, "30 วัน": 30, "60 วัน": 60, "90 วัน": 90, "180 วัน": 180}
 
 
 @st.cache_resource
 def market() -> MarketData:
     return MarketData()
+
+
+@st.cache_resource
+def shared_store() -> dict:
+    """ที่เก็บกลางของแอป (อยู่ข้ามการรีเฟรช/เปิดแท็บใหม่): cache ผล AI ค้นเว็บ + ผลวิเคราะห์ล่าสุด"""
+    return {"research_cache": {}, "results": {}}
+
+
+def _run_key(watch: list[str], horizon: int, n_extra: int, ai: bool, news: bool, fast: bool) -> tuple:
+    return (tuple(watch), horizon, n_extra, ai, news, fast)
+
+
+def cached_result(key: tuple) -> dict | None:
+    hit = shared_store()["results"].get(key)
+    return hit[1] if hit and time.time() - hit[0] < RESULT_TTL_S else None
+
+
+def latest_result() -> dict | None:
+    """ผลล่าสุดที่ยังไม่หมดอายุ (ใช้แสดงทันทีเมื่อเปิดแอปใหม่)"""
+    live = [v for v in shared_store()["results"].values() if time.time() - v[0] < RESULT_TTL_S]
+    return max(live, key=lambda v: v[0])[1] if live else None
 
 
 def _secret(k: str) -> str:
@@ -67,18 +91,21 @@ def _md_table(df: pd.DataFrame) -> str:
 def chart(c: dict):
     if go is None:
         return None
-    x = c["d1"].iloc[-220:]
+    x = c["d1"].iloc[-CHART_DAYS:]
     fig = go.Figure(go.Candlestick(x=x.index, open=x.open, high=x.high, low=x.low, close=x.close, name=c["ticker"],
                                    increasing_line_color="#16a34a", decreasing_line_color="#dc2626"))
     for k, col in (("ema21", "#22d3ee"), ("ema50", "#f59e0b"), ("ema200", "#a78bfa")):
         fig.add_trace(go.Scatter(x=x.index, y=x[k], name=k.upper(), line=dict(width=1.2, color=col)))
     m, l = c["med"], c["long"]
     fig.add_hrect(y0=m["zone"][0], y1=m["zone"][1], fillcolor="#22c55e", opacity=0.15, line_width=0)
-    lines = [(m["tp1"], "TP1", "#16a34a"), (m["tp2"], "TP2", "#15803d"), (m["sl"], "SL", "#dc2626"),
-             (c["vp"]["poc"], "POC", "#94a3b8"), *[(p, f"DCA{i + 1}", "#38bdf8") for i, p in enumerate(l["tiers"])]]
-    lines += [(p["target"], f"เป้า {p['name']}", "#eab308") for p in c.get("patterns", [])[:2]]
-    for y, t, col in lines:
+    # เส้นหลัก (แสดงเสมอ): SL / TP1 / TP2 · เส้นรอง (กดที่คำอธิบายใต้กราฟเพื่อเปิด): POC / DCA / เป้ารูปแบบกราฟ
+    for y, t, col in ((m["tp1"], "TP1", "#16a34a"), (m["tp2"], "TP2", "#15803d"), (m["sl"], "SL", "#dc2626")):
         fig.add_hline(y=y, line_dash="dot", line_color=col, annotation_text=f"{t} {fp(y)}", annotation_position="right")
+    extra = [(c["vp"]["poc"], "POC", "#94a3b8"), *[(p, f"DCA{i + 1}", "#38bdf8") for i, p in enumerate(l["tiers"])]]
+    extra += [(p["target"], f"เป้า {p['name']}", "#eab308") for p in c.get("patterns", [])[:2]]
+    for y, t, col in extra:
+        fig.add_trace(go.Scatter(x=[x.index[0], x.index[-1]], y=[y, y], mode="lines", name=f"{t} {fp(y)}",
+                                 line=dict(dash="dot", color=col, width=1), visible="legendonly"))
     if c["fc"]:
         last = x.index[-1]
         hs = sorted(c["fc"])
@@ -89,8 +116,16 @@ def chart(c: dict):
                                  line=dict(width=0), name="กรอบคาดการณ์ 50%"))
         fig.add_trace(go.Scatter(x=xs, y=[c["price"]] + [c["fc"][H]["end50"] for H in hs], name="ค่ากลางคาดการณ์",
                                  line=dict(dash="dash", color="#38bdf8", width=1.2)))
-    fig.update_layout(height=480, margin=dict(l=8, r=8, t=28, b=8), xaxis_rangeslider_visible=False,
-                      template="plotly_dark", legend=dict(orientation="h", y=1.07))
+    # ซูมแกนราคาให้พอดีกับช่วงที่แสดง + เส้นหลัก (ไม่ให้ยอดเก่าที่สูงมากบีบราคาปัจจุบันจนมองไม่เห็น)
+    keys = [x["low"].min(), x["high"].max(), m["sl"], m["tp2"], m["zone"][0]]
+    if c["fc"]:
+        keys += [c["fc"][H]["end25"] for H in c["fc"] if H <= 60] + [c["fc"][H]["end75"] for H in c["fc"] if H <= 60]
+    ylo, yhi = float(np.nanmin(keys)), float(np.nanmax(keys))
+    pad = (yhi - ylo) * 0.06
+    fig.update_layout(height=460, margin=dict(l=8, r=8, t=28, b=8), xaxis_rangeslider_visible=False,
+                      template="plotly_dark", legend=dict(orientation="h", y=-0.12),
+                      yaxis=dict(range=[ylo - pad, yhi + pad]),
+                      xaxis=dict(range=[x.index[0], x.index[-1] + pd.Timedelta(days=60)]))
     return fig
 
 
@@ -532,19 +567,31 @@ def _pc(x) -> str:
     return "-" if x is None else f"{x * 100:+.1f}%"
 
 
-def prob_cards_html(hz: list[dict], labels: tuple[str, ...] = ("1 วัน", "1 สัปดาห์", "1 เดือน", "3 เดือน")) -> str:
+def picked_label(hz: list[dict], horizon: int | None) -> str | None:
+    """การ์ดที่ตรงกับ 'อยากถือประมาณ' มากที่สุด (เช่น 30 วัน → 1 เดือน)"""
+    cand = [h for h in hz if h["H"] <= 90 and h.get("p_up") is not None]
+    if not cand or not horizon:
+        return None
+    return min(cand, key=lambda h: (abs(np.log(h["H"] / horizon)), -h["H"]))["label"]
+
+
+def prob_cards_html(hz: list[dict], labels: tuple[str, ...] = ("1 วัน", "1 สัปดาห์", "1 เดือน", "3 เดือน"),
+                    picked: str | None = None) -> str:
     """การ์ดโอกาสขึ้น/ลงรายช่วงเวลา: แถบขึ้น-ลง % · กรอบราคา 50% กลาง · ถ้าขึ้น/ถ้าลง ปกติกี่ % · ป้ายความน่าเชื่อถือ"""
     cards = []
     for h in hz:
         if h["label"] not in labels or h.get("p_up") is None:
             continue
+        mine = h["label"] == picked
+        border = "2px solid #38bdf8" if mine else "1px solid rgba(148,163,184,.35)"
+        tag = " · ⭐ ช่วงที่คุณเลือก" if mine else ""
         up = int(round(h["p_up"] * 100))
         bg, fg = REL_STYLE.get(h.get("rel_level", "info"), REL_STYLE["info"])
         ev = h.get("ev")
         ev_txt = f" · ค่าคาดหวัง <b style='color:{'#16a34a' if ev > 0 else '#dc2626'}'>{_pc(ev)}</b>" if ev is not None else ""
-        cards.append(f"""<div style="border:1px solid rgba(148,163,184,.35);border-radius:12px;padding:10px 12px;margin-bottom:8px">
+        cards.append(f"""<div style="border:{border};border-radius:12px;padding:10px 12px;margin-bottom:8px">
 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-<span style="font-weight:600;font-size:15px">{h['label']} · {h['direction']}</span>
+<span style="font-weight:600;font-size:15px">{h['label']} · {h['direction']}{tag}</span>
 <span style="font-size:12px;padding:2px 8px;border-radius:8px;background:{bg};color:{fg}">{h.get('reliability', '')}</span></div>
 <div style="display:flex;height:24px;border-radius:6px;overflow:hidden;margin:8px 0 6px;font-size:13px;font-weight:600">
 <div style="width:{max(up, 12)}%;background:rgba(22,163,74,.85);color:#fff;display:flex;align-items:center;padding-left:6px">ขึ้น {up}%</div>
@@ -555,9 +602,9 @@ def prob_cards_html(hz: list[dict], labels: tuple[str, ...] = ("1 วัน", "1
     return "\n".join(cards)
 
 
-def render_prob_cards(dp: dict):
+def render_prob_cards(dp: dict, horizon: int | None = None):
     hz = (dp.get("data") or {}).get("horizons") or []
-    html = prob_cards_html(hz)
+    html = prob_cards_html(hz, picked=picked_label(hz, horizon))
     if not html:
         return
     st.markdown(f"#### 🎲 โอกาสขึ้น / ลง ของ {dp['focus']} แต่ละช่วงเวลา")
@@ -568,7 +615,7 @@ def render_prob_cards(dp: dict):
 
 
 def render_home(res: dict, capital: float, risk_pct: float):
-    """หน้าแรก: คำตอบเดียว ซื้อ / รอ / เลี่ยง + เหตุผล + ทิศทางแต่ละช่วงเวลา + แผน + ความแม่นที่ทดสอบแล้ว"""
+    """หน้าแรก (v6.6 เรียงใหม่): คำตอบ → โอกาสขึ้น/ลงรายช่วงเวลา → แผนเข้า-ออก → เหตุผล · ที่เหลือพับเก็บ"""
     dp = res.get("deep") or {}
     focus = dp.get("focus")
     cb = {x["ticker"]: x for x in res["coins"]}
@@ -577,49 +624,58 @@ def render_home(res: dict, capital: float, risk_pct: float):
         return
     c = cb[focus]
     v = final_verdict(c, dp.get("data"))
+    hz_days = res.get("horizon", 30)
+    # 1) คำตอบ
     box = {"green": st.success, "orange": st.warning, "red": st.error}[v["color"]]
     box(f"### {v['action']} · {focus} {fp(c['price'])}\n{v['line']}")
     k = st.columns(3)
     ck = c.get("score_check") or {}
     k[0].metric("คะแนนควรซื้อ", f"{v['score']:.0f}/100", "AI + ระบบ" if c.get("buy_ai") is not None else "ระบบ")
-    k[1].metric(f"โอกาสขึ้นใน {horizon_bucket(res.get('horizon', 30))} วัน", fprob(v["p_up"]),
+    k[1].metric(f"โอกาสขึ้นใน {horizon_bucket(hz_days)} วัน", fprob(v["p_up"]),
                 "ปรับเทียบกับผลจริงแล้ว" if ck.get("ok") else "สถิติย้อนหลัง")
     k[2].metric("มุมมอง", outlook_label(c))
-    render_prob_cards(dp)
     ai = dp.get("ai") or {}
     if ai.get("thesis"):
         st.info(f"🧠 **AI สรุป:** {ai['thesis']}")
-    st.markdown("**ทำไม**\n" + "\n".join(f"- {r}" for r in v["reasons"]))
+    # 2) โอกาสขึ้น/ลง
+    render_prob_cards(dp, hz_days)
+    # 3) แผนเข้า-ออก + ขนาดไม้
+    st.markdown("#### 📋 แผนเข้า-ออก")
+    st.dataframe(trade_plan_table([c], res["ts"]), use_container_width=True, hide_index=True)
     rd = c.get("read")
-    if rd:
-        st.markdown(f"**เหตุการณ์ที่กำลังเกิด: {rd['phase']}** — {rd['phase_why']}")
-        if rd["evidence"]:
-            st.markdown("**หลักฐานแรงซื้อ / แรงขาย**\n" + "\n".join(
-                f"- {'🟢' if e['sign'] > 0 else '🔴'} {e['text']}" for e in rd["evidence"]))
-    if not v["recommend"]:
-        render_downside(c, res.get("horizon", 30))
-        if rd and rd["when"]:
-            st.markdown(f"**⏱ คาดว่าการย่อจะจบเมื่อไหร่:** {rd['when']}")
-        if rd and rd.get("ai_wait"):
-            st.info(f"🧠 **AI:** {rd['ai_wait']}")
-    else:
+    if v["recommend"]:
         sz = size_medium(c, capital, risk_pct, None)
         st.markdown(f"**ขนาดไม้ที่แนะนำ:** {sz['qty']:.4g} {focus} ≈ ${sz['notional']:,.0f} · ถ้าโดน SL เสีย "
                     f"${sz['loss']:,.0f} ({sz['loss_pct']:.2f}% ของทุน)")
+    elif rd and rd.get("ai_wait"):
+        st.info(f"🧠 **AI:** {rd['ai_wait']}")
+    # 4) เหตุผล
+    st.markdown("#### 💡 ทำไม\n" + "\n".join(f"- {r}" for r in v["reasons"]))
     if v["accuracy"]:
         st.caption("🧪 " + v["accuracy"])
-    render_fundamentals(dp, c, compact=True)
+    # 5) รายละเอียด (พับเก็บ)
+    if rd:
+        with st.expander(f"🔎 เหตุการณ์ที่กำลังเกิด: {rd['phase']} · หลักฐานแรงซื้อ/ขาย"):
+            st.markdown(rd["phase_why"])
+            if rd["evidence"]:
+                st.markdown("\n".join(f"- {'🟢' if e['sign'] > 0 else '🔴'} {e['text']}" for e in rd["evidence"]))
+            if rd.get("when"):
+                st.markdown(f"**⏱ คาดว่าการย่อจะจบเมื่อไหร่:** {rd['when']}")
+    if not v["recommend"]:
+        with st.expander("📉 ถ้ายังไม่ซื้อ: ราคาอาจย่อถึงไหน / โซนพิจารณาซื้อ"):
+            render_downside(c, hz_days)
+    with st.expander(f"🏛 ข้อมูลพื้นฐาน {focus}"):
+        render_fundamentals(dp, c, compact=True)
     if dp.get("data"):
         with st.expander("🧭 คะแนนทิศทางแต่ละช่วงเวลา (ตาราง + 1 ปี)"):
             render_horizons(dp, c, show_signals=False)
-    st.markdown("#### 📋 แผนเข้า-ออก")
-    st.dataframe(trade_plan_table([c], res["ts"]), use_container_width=True, hide_index=True)
     checks = list(((dp.get("data") or {}).get("checks") or {}).values())
     if checks:
-        st.markdown("#### 🧪 คะแนนแบบนี้เคยแม่นแค่ไหนกับเหรียญนี้ (ทดสอบย้อนหลัง)")
-        st.dataframe(check_table(checks), use_container_width=True, hide_index=True)
-        st.caption("คำนวณคะแนนเทคนิคทุกวันในอดีต แล้วดูว่าหลังจากนั้นราคาขึ้นจริงไหม · ใช้เฉพาะข้อมูลที่รู้ ณ วันนั้น (walk-forward) · "
-                   "ทดสอบช่วง 30% ท้าย · Skill > 0 = ทายได้ดีกว่าการเดาด้วยค่าเฉลี่ย · ถ้าไม่ผ่าน ระบบลดน้ำหนักเทคนิคในคะแนนอัตโนมัติ")
+        with st.expander("🧪 คะแนนแบบนี้เคยแม่นแค่ไหนกับเหรียญนี้ (ทดสอบย้อนหลัง)"):
+            st.dataframe(check_table(checks), use_container_width=True, hide_index=True)
+            st.caption("คำนวณคะแนนเทคนิคทุกวันในอดีต แล้วดูว่าหลังจากนั้นราคาขึ้นจริงไหม · ใช้เฉพาะข้อมูลที่รู้ ณ วันนั้น "
+                       "(walk-forward) · ทดสอบช่วง 30% ท้าย · Skill > 0 = ทายได้ดีกว่าการเดาด้วยค่าเฉลี่ย · "
+                       "ถ้าไม่ผ่าน ระบบลดน้ำหนักเทคนิคในคะแนนอัตโนมัติ")
     st.caption("ดูรายละเอียดทั้งหมด (หลายกรอบเวลา, 6 กลยุทธ์, คู่แข่ง, โปรเจกต์, กราฟ) ได้ที่แท็บ 🔬 เจาะลึก")
 
 
@@ -805,7 +861,9 @@ def render_export(res: dict, horizon: int):
 
 # ═══════════════════════════ main ═══════════════════════════
 def main():
-    st.set_page_config(page_title="Crypto AI Intelligence Lab", page_icon="🧠", layout="wide")
+    has_res = bool(st.session_state.get("res")) or latest_result() is not None
+    st.set_page_config(page_title="Crypto AI Intelligence Lab", page_icon="🧠", layout="wide",
+                       initial_sidebar_state="collapsed" if has_res else "expanded")  # มีผลแล้ว → พับ Sidebar ให้จอกว้าง
     st.markdown("<style>.block-container{padding-top:1.2rem;max-width:1500px}"
                 "div[data-testid='stMetricValue']{font-size:1.2rem}"
                 "blockquote{border-left:4px solid #38bdf8;background:rgba(56,189,248,.07);padding:.4rem .8rem}</style>",
@@ -822,6 +880,8 @@ def main():
         risk_pct = st.slider("🛡 ยอมเสียต่อไม้ (% ทุน)", 0.25, 3.0, 1.0, 0.25)
         gkey = _secret("GEMINI_API_KEY") or st.text_input("🔑 Gemini API Key", type="password")
         run = st.button("🚀 เริ่มวิเคราะห์", type="primary", use_container_width=True)
+        fast = st.toggle("⚡ โหมดเร็ว (แนะนำ)", value=True,
+                         help="ข่าวใช้การวิเคราะห์แบบคำสำคัญแทน AI · ใช้ผลเดิมถ้าเพิ่งวิเคราะห์ด้วยค่าเดียวกันภายใน 15 นาที")
         with st.expander("🔧 ตั้งค่าขั้นสูง"):
             cgkey = _secret("COINGECKO_DEMO_KEY") or st.text_input("CoinGecko Demo Key (ไม่บังคับ)", type="password")
             n_extra = st.slider("🤖 ให้ AI คัดเหรียญจากตลาด", 0, 10, SCAN_DEFAULT_EXTRA)
@@ -831,7 +891,8 @@ def main():
             msel = st.selectbox("🧠 โมเดล AI", GEMINI_MODELS + ["อื่นๆ (พิมพ์เอง)"], index=0)
             model = st.text_input("ชื่อโมเดล", "gemini-flash-latest") if msel.startswith("อื่น") else msel
             model_research = st.selectbox("📰 โมเดล Research (ค้นเว็บ)", GEMINI_MODELS, index=0)
-            n_research = st.slider("จำนวนเหรียญให้ AI Research", 0, 12, 4)
+            n_research = st.slider("จำนวนเหรียญให้ AI Research", 0, MAX_RESEARCH, 2,
+                                   help="ค้นเว็บใช้โควต้า Gemini มาก · จำกัดสูงสุด 4 เหรียญ (= 1 ครั้งต่อรอบ)")
             use_ai = st.toggle("เปิด AI Agents", value=bool(gkey))
             use_news = st.toggle("📰 เปิด News Agent", value=True)
             news_w = st.slider("น้ำหนักข่าวต่อคะแนน (±)", 0, 15, 8)
@@ -841,6 +902,8 @@ def main():
                 na.clear_cache()
                 for k in ("research_cache", "res", "port_res"):
                     st.session_state.pop(k, None)
+                shared_store()["results"].clear()
+                shared_store()["research_cache"].clear()
 
     horizon = HORIZONS[hz]
     client = make_client(gkey) if use_ai else None
@@ -849,22 +912,34 @@ def main():
 
     if run:
         watch = list(dict.fromkeys(w.strip().upper().replace(QUOTE, "") for w in watch_raw.split(",") if w.strip()))
-        cfg = RunConfig(watch=watch, n_extra=n_extra, min_qvol=min_qvol, cg_key=cgkey, client=client, model=model,
-                        model_research=model_research, n_research=n_research, n_med=n_med, n_long=n_long,
-                        use_news=use_news, news_w=news_w, horizon=horizon,
-                        research_cache=st.session_state.setdefault("research_cache", {}))
-        with st.status("กำลังประมวลผล Multi-Agent…", expanded=True) as status:
-            bar = st.progress(0.0, text="📡 ดึงข้อมูล")
-            try:
-                st.session_state["res"] = run_pipeline(
-                    market(), cfg, progress=lambda s: status.update(label=s),
-                    bar=lambda f, t: bar.progress(min(f, 1.0), text=f"📡 ดึงข้อมูล {t}"))
-                bar.empty()
-                status.update(label="✅ เสร็จสิ้น", state="complete", expanded=False)
-            except Exception as e:  # noqa: BLE001
-                status.update(label="❌ ผิดพลาด", state="error")
-                st.error(f"วิเคราะห์ไม่สำเร็จ: {e}")
-                st.stop()
+        key = _run_key(watch, horizon, n_extra, client is not None, use_news, fast)
+        hit = cached_result(key) if fast else None
+        if hit is not None:
+            st.session_state["res"] = hit
+            st.toast(f"⚡ ใช้ผลที่วิเคราะห์เมื่อ {hit['ts']:%H:%M} (ไม่เกิน 15 นาที) · ปิดโหมดเร็วถ้าต้องการวิเคราะห์ใหม่")
+        else:
+            cfg = RunConfig(watch=watch, n_extra=n_extra, min_qvol=min_qvol, cg_key=cgkey, client=client, model=model,
+                            model_research=model_research, n_research=n_research, n_med=n_med, n_long=n_long,
+                            use_news=use_news, news_w=news_w, horizon=horizon, news_ai=not fast,
+                            research_cache=shared_store()["research_cache"])
+            with st.status("กำลังประมวลผล Multi-Agent…", expanded=True) as status:
+                bar = st.progress(0.0, text="📡 ดึงข้อมูล")
+                try:
+                    st.session_state["res"] = run_pipeline(
+                        market(), cfg, progress=lambda s: status.update(label=s),
+                        bar=lambda f, t: bar.progress(min(f, 1.0), text=f"📡 ดึงข้อมูล {t}"))
+                    shared_store()["results"][key] = (time.time(), st.session_state["res"])
+                    bar.empty()
+                    status.update(label=f"✅ เสร็จสิ้น ({st.session_state['res']['elapsed']:.0f} วินาที)",
+                                  state="complete", expanded=False)
+                except Exception as e:  # noqa: BLE001
+                    status.update(label="❌ ผิดพลาด", state="error")
+                    st.error(f"วิเคราะห์ไม่สำเร็จ: {e}")
+                    st.stop()
+
+    if not st.session_state.get("res") and (last := latest_result()) is not None:
+        st.session_state["res"] = last  # เปิดแอปใหม่/รีเฟรช → แสดงผลล่าสุดทันที
+        st.caption(f"⚡ แสดงผลที่วิเคราะห์เมื่อ {last['ts']:%H:%M} · กด 🚀 เพื่อวิเคราะห์ใหม่")
 
     res = st.session_state.get("res")
     if not res:
