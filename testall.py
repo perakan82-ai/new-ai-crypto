@@ -298,9 +298,13 @@ def make_streamlit(calls):
     st.secrets = {}
     st.sidebar = _Stub(calls)
     passthru = lambda f=None, **k: f if f else (lambda g: g)  # noqa: E731
-    st.cache_resource = passthru
+    import functools  # noqa: PLC0415
+
+    def memo(f=None, **k):  # cache_resource จริงจำค่าไว้ข้ามการรัน
+        return functools.cache(f) if f else (lambda g: functools.cache(g))
+    memo.clear = lambda: None  # type: ignore[attr-defined]
+    st.cache_resource = memo
     st.cache_data = passthru
-    st.cache_resource.clear = lambda: None  # type: ignore[attr-defined]
 
     class _StopError(Exception):
         pass
@@ -730,7 +734,8 @@ def test_model_discovery_and_chain():
                         M("gemini-3.9-flash-preview"), M("gemini-3.8-flash-image"), M("text-embedding-004"),
                         M("gemini-3.8-flash-tts"), M("gemini-x", acts=("embedContent",))]
     found = ai.discover_models(C())
-    assert found[:3] == ["gemini-3.9-flash-preview", "gemini-3.8-flash", "gemini-3.8-pro"] or found[0] == "gemini-3.9-flash-preview"
+    assert found[:3] == ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"]  # stable flash ก่อน
+    assert found.index("gemini-3.8-pro") < found.index("gemini-3.9-flash-preview")  # preview ท้ายสุด
     assert not any(x in " ".join(found) for x in ("image", "embedding", "tts", "gemini-x"))
     ai._DISCOVERED[:] = found
     ch = ai.model_chain(ai.AUTO_MODEL)
@@ -852,3 +857,15 @@ def test_prob_cards_fields_and_html():
     assert reliability({"ok": True, "verdict": "✅"}, 50)[1] == "ok"
     assert reliability({"ok": True, "verdict": "✅"}, 10)[1] == "warn"
     assert reliability({"ok": False, "verdict": "🔴 x"}, 50)[1] == "bad"
+
+
+def test_result_cache_reuse(app_mod):
+    app, _ = app_mod
+    store = app.shared_store()
+    store["results"].clear()
+    key = app._run_key(["SOL"], 30, 3, True, True, True)
+    assert app.cached_result(key) is None and app.latest_result() is None
+    store["results"][key] = (app.time.time(), {"ts": 1})
+    assert app.cached_result(key) == {"ts": 1} and app.latest_result() == {"ts": 1}
+    store["results"][key] = (app.time.time() - app.RESULT_TTL_S - 1, {"ts": 1})
+    assert app.cached_result(key) is None and app.latest_result() is None
