@@ -16,7 +16,7 @@ from typing import Callable
 from typing import Literal
 from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, macro_calendar_agent, research_agent,
                 strategist_and_risk)
-from config import (FEE, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
+from config import (FEE, MAX_RESEARCH, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
                     STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
 from analysis import _fc_samples, regime_arr, technical_votes
 from ai import _DISCOVERED as _ai_found, coin_brief, enforce_horizon_views, focus_ai, project_deep_agent
@@ -533,7 +533,7 @@ class RunConfig:
     client: object | None = None
     model: str = "gemini-2.5-flash"
     model_research: str = "gemini-2.5-flash"
-    n_research: int = 8
+    n_research: int = 4
     n_med: int = 3
     n_long: int = 3
     use_news: bool = True
@@ -1431,7 +1431,7 @@ def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> 
     if ai_on:
         focus_c = [fc_] if fc_ is not None else []  # เหรียญที่เจาะลึกได้ Research เสมอ
         short = focus_c + [c for c in sorted(analyzed, key=lambda c: c["score"], reverse=True) if c not in focus_c]
-        short = short[: max(cfg.n_research, len(focus_c))]
+        short = short[: max(min(cfg.n_research, MAX_RESEARCH), len(focus_c))]  # จำกัดเพื่อกันโควต้าหมด
         f_res = pool.submit(research_agent, cfg.client, cfg.model_research, short, cfg.research_cache, None,
                             news["items"], na.headlines,
                             lambda c: [f"{x['date']} {x['src']}: {x['title']}"
