@@ -1,7 +1,7 @@
 """ค่าตั้งค่าทั้งหมด + HTTP session/cache + ฟังก์ชันจัดรูปแบบตัวเลข"""
 from __future__ import annotations
 
-__version__ = "6.6.0"
+__version__ = "6.6.1"
 
 import functools
 import numpy as np
