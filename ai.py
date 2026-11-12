@@ -129,6 +129,18 @@ _SKIP_MODEL = ("404", "NOT_FOUND", "not found", "is not supported", "deprecated"
 
 
 _DISCOVERED: list[str] = []
+_QUOTA_OUT: dict[str, float] = {}   # โมเดล → เวลาที่หมดโควต้าถึง (v6.6.1: ไม่ยิงซ้ำโมเดลที่โควต้าหมดแล้ว)
+QUOTA_COOLDOWN_S = 10 * 60
+
+
+def _quota_error(msg: str) -> bool:
+    return "RESOURCE_EXHAUSTED" in msg or ("429" in msg and "quota" in msg.lower())
+
+
+def quota_blocked() -> list[str]:
+    """รายชื่อโมเดลที่ยังติดโควต้าหมด (ใช้แสดงในแอป)"""
+    now = time.time()
+    return [m for m, t in _QUOTA_OUT.items() if t > now]
 _SKIP_NAME = ("image", "tts", "live", "embedding", "audio", "robotics", "computer-use", "nano", "gemma", "aqa", "learnlm",
               "veo", "imagen", "omni")
 
@@ -234,7 +246,12 @@ def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search
     modes.append(("schema", dict(response_mime_type="application/json", response_schema=schema)))
     errs: list[str] = []
     deadline = time.monotonic() + budget_s
-    for m in model_chain(model):
+    chain = [m for m in model_chain(model) if _QUOTA_OUT.get(m, 0) <= time.time()]
+    if not chain:  # ทุกโมเดลโควต้าหมด → ไม่ต้องรอ ใช้ผลแบบ rule-based ทันที
+        return None, [], "quota", ["RESOURCE_EXHAUSTED quota: โควต้า Gemini หมดทุกโมเดล — ข้าม AI รอบนี้ (ลองใหม่ใน ~10 นาที)"]
+    for m in chain:
+        if _QUOTA_OUT.get(m, 0) > time.time():  # Agent อื่นที่รันพร้อมกันเพิ่งเจอโควต้าหมด
+            continue
         for name, kw in modes:
             if time.monotonic() > deadline:
                 errs.append(f"หมดเวลา {budget_s:.0f}s — ใช้ผลแบบ rule-based แทน")
@@ -250,6 +267,9 @@ def gemini_json(client, model: str, prompt: str, schema: type[BaseModel], search
                 errs.append(f"{m}:{name}: {msg[:110]}")
                 if "API key" in msg or "PERMISSION_DENIED" in msg:
                     return None, [], "failed", errs
+                if _quota_error(msg):
+                    _QUOTA_OUT[m] = time.time() + QUOTA_COOLDOWN_S
+                    break
                 if any(k in msg for k in _SKIP_MODEL) or any(k in msg for k in _TIMEOUT_MSG):
                     break
     return None, [], "failed", errs
