@@ -5,6 +5,8 @@
   TELEGRAM_BOT_TOKEN  จำเป็น
   TELEGRAM_CHAT_ID    จำเป็น
   SCAN_WATCH          ไม่จำเป็น (ค่าเริ่มต้น = DEFAULT_WATCH ใน config.py เช่น "SOL")
+                       ใส่ได้หลายเหรียญ คั่นด้วยจุลภาค เช่น "SOL,BTC,ETH,HYPE"
+                       (MAX_WATCH ของ pipeline เจาะลึกได้ครั้งละ 1 เหรียญ จึงวนรันทีละเหรียญแยกกัน)
 """
 from __future__ import annotations
 
@@ -33,26 +35,41 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
             print(f"Telegram ส่งไม่สำเร็จ: {r.status_code} {r.text}", file=sys.stderr)
 
 
+def scan_one(md: MarketData, client, coin: str) -> str:
+    """สแกนเจาะลึก 1 เหรียญ แล้วคืนข้อความสรุปพร้อมส่ง Telegram"""
+    cfg = RunConfig(watch=[coin], client=client, model=AUTO_MODEL, model_research=AUTO_MODEL)
+    res = run_pipeline(md, cfg, progress=print)
+    if coin in res.get("missing", []):
+        return (f"⚠️ {coin}: ไม่พบคู่เทรด {coin}USDT ในตลาด (อาจสะกดชื่อย่อไม่ตรงกับที่ขึ้นในตลาด "
+                f"หรือยังไม่ได้จดทะเบียนคู่ USDT) — ข้ามเหรียญนี้ไป")
+    return summary_text(res, res["coins"], res["port"])
+
+
 def main() -> None:
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
-    watch = os.environ.get("SCAN_WATCH", DEFAULT_WATCH)
+    watch_raw = os.environ.get("SCAN_WATCH", DEFAULT_WATCH)
+    coins = [c.strip().upper() for c in watch_raw.split(",") if c.strip()]
 
     md = MarketData()
     client = make_client(gemini_key)
-    cfg = RunConfig(watch=[watch], client=client, model=AUTO_MODEL, model_research=AUTO_MODEL)
 
-    try:
-        res = run_pipeline(md, cfg, progress=print)
-        text = summary_text(res, res["coins"], res["port"])
-    except Exception as e:  # noqa: BLE001 — ให้รู้ผ่าน Telegram ว่าสแกนรอบนี้ล้มเหลว ไม่ใช่เงียบหาย
-        err = f"⚠️ สแกนประจำวันล้มเหลว: {e}\n\n" + traceback.format_exc()[-1500:]
-        send_telegram(tg_token, tg_chat, err)
-        raise
+    any_sent = False
+    for coin in coins:
+        try:
+            text = scan_one(md, client, coin)
+        except Exception as e:  # noqa: BLE001 — ให้รู้ผ่าน Telegram ว่าเหรียญนี้ล้มเหลว แล้วไปเหรียญถัดไปต่อ
+            err = f"⚠️ สแกน {coin} ล้มเหลว: {e}\n\n" + traceback.format_exc()[-1200:]
+            send_telegram(tg_token, tg_chat, err)
+            any_sent = True
+            continue
+        send_telegram(tg_token, tg_chat, text)
+        any_sent = True
 
-    send_telegram(tg_token, tg_chat, text)
-    print("ส่งรายงานเข้า Telegram สำเร็จ")
+    if not any_sent:
+        send_telegram(tg_token, tg_chat, "⚠️ ไม่มีเหรียญให้สแกน (ตรวจค่า SCAN_WATCH)")
+    print("สแกนประจำวันเสร็จสิ้น")
 
 
 if __name__ == "__main__":
