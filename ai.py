@@ -146,11 +146,12 @@ _SKIP_NAME = ("image", "tts", "live", "embedding", "audio", "robotics", "compute
 
 
 def _model_rank(name: str) -> tuple:
-    """เรียงโมเดลสำหรับโหมดอัตโนมัติ (v6.6 เหมาะกับคีย์ฟรี): stable ก่อน preview · flash > flash-lite > pro ·
-    แล้วค่อยเวอร์ชันใหม่ก่อน — preview/pro เร็วน้อยกว่าและโควต้าฟรีต่ำมาก จึงไว้ท้ายสุด"""
+    """เรียงโมเดลสำหรับโหมดอัตโนมัติ (v6.7 เหมาะกับคีย์ฟรี): stable ก่อน preview · flash-lite > flash > pro ·
+    แล้วค่อยเวอร์ชันใหม่ก่อน — flash-lite โควต้าฟรีต่อวันสูงกว่า flash ประมาณ 10-25 เท่า (Google free tier ปี 2026)
+    จึงลองก่อนเพื่อกันโควต้าหมดเร็ว ส่วน pro โควต้าฟรีต่ำมาก จึงไว้ท้ายสุด"""
     v = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
     ver = float(v.group(1)) if v else 0.0
-    tier = 0 if ("flash" in name and "lite" not in name) else (1 if "lite" in name else 2)
+    tier = 0 if "lite" in name else (1 if ("flash" in name and "lite" not in name) else 2)
     return ("preview" in name or "exp" in name, tier, -ver, name)
 
 

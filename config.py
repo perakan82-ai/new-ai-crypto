@@ -83,7 +83,7 @@ DEFAULT_WATCH = "SOL"
 
 AUTO_MODEL = "อัตโนมัติ (แนะนำ)"  # ถาม Google ว่ามีโมเดลไหนใช้ได้ แล้วเลือกตัวใหม่สุดเอง (Gemini 2.5 ปิดไปแล้ว 16 ต.ค. 2026)
 GEMINI_MODELS = [AUTO_MODEL, "gemini-flash-latest", "gemini-pro-latest", "gemini-flash-lite-latest"]
-MODEL_FALLBACK = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"]  # alias ที่ Google ชี้ไปรุ่นล่าสุดเสมอ
+MODEL_FALLBACK = ["gemini-flash-lite-latest", "gemini-flash-latest", "gemini-pro-latest"]  # alias ที่ Google ชี้ไปรุ่นล่าสุดเสมอ (lite ก่อน = โควต้าฟรีสูงกว่า)
 RESEARCH_TTL = 6 * 3600
 AI_TIMEOUT_S = 45      # รอ Gemini ต่อครั้งสูงสุด (วินาที) · เกินนี้ถือว่าล่ม แล้วลองโมเดลถัดไป (v6.5: 90 → 45)
 AI_BUDGET_S = 75       # เวลารวมสูงสุดต่อ 1 Agent (รวมทุกการลองซ้ำ) · หมดเวลา → ใช้ผลแบบ rule-based (v6.5: 180 → 75)

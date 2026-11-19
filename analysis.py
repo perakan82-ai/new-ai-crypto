@@ -845,6 +845,16 @@ def technical_votes(c: dict) -> dict:
     vr = float(x.vol_ratio) if np.isfinite(x.vol_ratio) else 1.0
     add("Volume / OBV", 1 if obv_up and x.close > x.ema20 else (-1 if not obv_up and x.close < x.ema20 else 0),
         f"OBV 20D {'สะสม' if obv_up else 'แจกจ่าย'} · Vol {vr:.1f}x")
+    vwap = float(x.vwap20) if "vwap20" in d and np.isfinite(x.vwap20) else None
+    if vwap is not None:
+        dv = x.close / vwap - 1
+        add("VWAP (20 แท่ง)", 1 if dv > 0.005 else (-1 if dv < -0.005 else 0),
+            f"ราคา {'เหนือ' if dv > 0 else 'ใต้'} VWAP {dv * 100:+.1f}%")
+    e9 = float(x.ema9) if "ema9" in d and np.isfinite(x.ema9) else None
+    if e9 is not None and np.isfinite(x.ema21):
+        e21v = float(x.ema21)
+        add("EMA9/21 โมเมนตัมสั้น", 1 if e9 > e21v else (-1 if e9 < e21v else 0),
+            f"EMA9 {'เหนือ' if e9 > e21v else 'ใต้'} EMA21 (จังหวะสั้นมาก)")
     of = mo.get("orderflow")
     if of is not None:
         add("Order flow (taker buy)", 1 if of > 0.02 else (-1 if of < -0.02 else 0), f"แรงซื้อเชิงรุก 7D vs 30D {of * 100:+.1f}%")
