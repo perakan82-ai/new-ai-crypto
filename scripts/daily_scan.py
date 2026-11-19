@@ -12,6 +12,9 @@ import os
 import sys
 import traceback
 
+# เพิ่ม path โฟลเดอร์หลักของโปรเจกต์ (นอก scripts/) เพื่อให้ import ai.py/config.py/... เจอ
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import requests
 
 from ai import make_client
