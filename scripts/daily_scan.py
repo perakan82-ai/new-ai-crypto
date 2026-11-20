@@ -7,6 +7,9 @@
   SCAN_WATCH          ไม่จำเป็น (ค่าเริ่มต้น = DEFAULT_WATCH ใน config.py เช่น "SOL")
                        ใส่ได้หลายเหรียญ คั่นด้วยจุลภาค เช่น "SOL,BTC,ETH,HYPE"
                        (MAX_WATCH ของ pipeline เจาะลึกได้ครั้งละ 1 เหรียญ จึงวนรันทีละเหรียญแยกกัน)
+
+v2: ตรวจ Telegram ก่อนเริ่มสแกนจริง (ping เบา ๆ) และทำให้ job ล้มเหลวชัดเจน (exit code != 0)
+    ถ้าส่งเข้า Telegram ไม่สำเร็จเลยสักครั้ง — กัน "สำเร็จ" หลอกแบบที่เจอมาก่อนหน้านี้
 """
 from __future__ import annotations
 
@@ -25,18 +28,26 @@ from market import MarketData
 from pipeline import RunConfig, run_pipeline, summary_text
 
 
-def send_telegram(token: str, chat_id: str, text: str) -> None:
-    """ส่งข้อความเข้า Telegram (ตัดเป็นท่อนละ ≤4000 ตัวอักษร ตามขีดจำกัดของ Telegram API)"""
+def send_telegram(token: str, chat_id: str, text: str) -> bool:
+    """ส่งข้อความเข้า Telegram (ตัดเป็นท่อนละ ≤4000 ตัวอักษร) คืนค่า True ถ้าส่งสำเร็จทุกท่อน"""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok_all = True
     for i in range(0, max(len(text), 1), 4000):
         chunk = text[i:i + 4000] or "(ไม่มีเนื้อหา)"
-        r = requests.post(url, data={"chat_id": chat_id, "text": chunk}, timeout=20)
+        try:
+            r = requests.post(url, data={"chat_id": chat_id, "text": chunk}, timeout=20)
+        except requests.RequestException as e:
+            print(f"Telegram เรียก API ไม่สำเร็จ (network): {e}", file=sys.stderr)
+            ok_all = False
+            continue
         if not r.ok:
-            print(f"Telegram ส่งไม่สำเร็จ: {r.status_code} {r.text}", file=sys.stderr)
+            print(f"Telegram ส่งไม่สำเร็จ: HTTP {r.status_code} — {r.text}", file=sys.stderr)
+            ok_all = False
+    return ok_all
 
 
 def scan_one(md: MarketData, client, coin: str) -> str:
-    """สแกนเจาะลึก 1 เหรียญ แล้วคืนข้อความสรุปพร้อมส่ง Telegram"""
+    """สแกนเจาะลึก 1 เหรียญ แล้วคืนข้อความสรุป"""
     cfg = RunConfig(watch=[coin], client=client, model=AUTO_MODEL, model_research=AUTO_MODEL)
     res = run_pipeline(md, cfg, progress=print)
     if coin in res.get("missing", []):
@@ -52,24 +63,38 @@ def main() -> None:
     watch_raw = os.environ.get("SCAN_WATCH", DEFAULT_WATCH)
     coins = [c.strip().upper() for c in watch_raw.split(",") if c.strip()]
 
+    # เช็ก Telegram ก่อนเริ่มสแกนจริง (เร็ว ไม่เปลืองโควต้า Gemini ถ้าตั้งค่าผิด) —
+    # ถ้าส่งไม่ได้ตั้งแต่ตรงนี้ ให้ job แดง (exit 1) ทันที จะได้รู้เร็ว ไม่ต้องรอสแกนจบ 2 นาทีแล้วค่อยพบว่าไม่มีอะไรถึงมือเราเลย
+    print(f"ตรวจการเชื่อมต่อ Telegram (bot token ลงท้าย ...{tg_token[-6:]}, chat_id={tg_chat})…")
+    if not send_telegram(tg_token, tg_chat, "🔧 เริ่มสแกนประจำวัน — ถ้าเห็นข้อความนี้แปลว่า Telegram เชื่อมถูกต้องแล้ว"):
+        print("Telegram ส่งข้อความทดสอบไม่สำเร็จ — ตรวจ secret TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ใหม่อีกรอบ", file=sys.stderr)
+        sys.exit(1)
+
     md = MarketData()
     client = make_client(gemini_key)
 
     any_sent = False
+    all_ok = True
     for coin in coins:
         try:
             text = scan_one(md, client, coin)
         except Exception as e:  # noqa: BLE001 — ให้รู้ผ่าน Telegram ว่าเหรียญนี้ล้มเหลว แล้วไปเหรียญถัดไปต่อ
             err = f"⚠️ สแกน {coin} ล้มเหลว: {e}\n\n" + traceback.format_exc()[-1200:]
-            send_telegram(tg_token, tg_chat, err)
-            any_sent = True
+            ok = send_telegram(tg_token, tg_chat, err)
+            any_sent = any_sent or ok
+            all_ok = all_ok and ok
             continue
-        send_telegram(tg_token, tg_chat, text)
-        any_sent = True
+        ok = send_telegram(tg_token, tg_chat, text)
+        any_sent = any_sent or ok
+        all_ok = all_ok and ok
 
     if not any_sent:
         send_telegram(tg_token, tg_chat, "⚠️ ไม่มีเหรียญให้สแกน (ตรวจค่า SCAN_WATCH)")
-    print("สแกนประจำวันเสร็จสิ้น")
+        sys.exit(1)
+
+    print("สแกนประจำวันเสร็จสิ้น" if all_ok else "สแกนเสร็จ แต่บางเหรียญส่ง Telegram ไม่สำเร็จ")
+    if not all_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
