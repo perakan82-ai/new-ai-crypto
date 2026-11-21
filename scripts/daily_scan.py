@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timezone, timedelta
 
@@ -57,6 +58,21 @@ def format_for_telegram(text: str) -> str:
     return "\n".join(out)
 
 
+def _post_with_retry(url: str, data: dict, tries: int = 3, timeout: int = 40):
+    """ยิง POST ซ้ำสูงสุด tries ครั้งถ้าเน็ตสะดุด (timeout/connection error) — กัน job แดงเล่นจากเน็ตกระตุกชั่วคราว
+    เช่นที่เจอวันนี้ (ส่งถึง Telegram จริงแล้วแต่รอผลตอบกลับไม่ทัน)"""
+    last_exc = None
+    for attempt in range(1, tries + 1):
+        try:
+            return requests.post(url, data=data, timeout=timeout)
+        except requests.RequestException as e:
+            last_exc = e
+            print(f"Telegram เรียก API ไม่สำเร็จ (network, ครั้งที่ {attempt}/{tries}): {e}", file=sys.stderr)
+            if attempt < tries:
+                time.sleep(3 * attempt)
+    raise last_exc
+
+
 def send_telegram(token: str, chat_id: str, text: str, html_mode: bool = False) -> bool:
     """ส่งข้อความเข้า Telegram (ตัดเป็นท่อนละ ≤4000 ตัวอักษร) คืนค่า True ถ้าส่งสำเร็จทุกท่อน"""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -67,15 +83,20 @@ def send_telegram(token: str, chat_id: str, text: str, html_mode: bool = False) 
         if html_mode:
             data["parse_mode"] = "HTML"
         try:
-            r = requests.post(url, data=data, timeout=20)
+            r = _post_with_retry(url, data)
         except requests.RequestException as e:
-            print(f"Telegram เรียก API ไม่สำเร็จ (network): {e}", file=sys.stderr)
+            print(f"Telegram เรียก API ไม่สำเร็จ (network) หลังลองซ้ำแล้ว: {e}", file=sys.stderr)
             ok_all = False
             continue
         if not r.ok and html_mode:
             # กันไว้เผื่อ HTML parse พลาด (อักขระหลุดรูป) — ส่งใหม่แบบ plain text แทนล้มเหลวเงียบ ๆ
             print(f"Telegram HTML ส่งไม่สำเร็จ ({r.status_code}) ลองส่งแบบ plain text แทน: {r.text}", file=sys.stderr)
-            r = requests.post(url, data={"chat_id": chat_id, "text": chunk}, timeout=20)
+            try:
+                r = _post_with_retry(url, {"chat_id": chat_id, "text": chunk})
+            except requests.RequestException as e:
+                print(f"Telegram ส่ง plain text แทนก็ไม่สำเร็จ (network): {e}", file=sys.stderr)
+                ok_all = False
+                continue
         if not r.ok:
             print(f"Telegram ส่งไม่สำเร็จ: HTTP {r.status_code} — {r.text}", file=sys.stderr)
             ok_all = False
