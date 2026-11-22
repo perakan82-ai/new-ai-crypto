@@ -3,7 +3,7 @@ name: Daily Crypto Scan
 on:
   schedule:
     # 07:00 เวลาไทย (UTC+7) = 00:00 UTC ทุกวัน
-    - cron: "0 0 * * *"
+    - cron: "7 22 * * *"
   workflow_dispatch: {}
 
 jobs:
