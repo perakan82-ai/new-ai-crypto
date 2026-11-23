@@ -974,3 +974,21 @@ def test_alert_picks_rank_and_block():
     txt = "\n".join(ca.picks_block(top, "🟡"))
     assert "ผ่านเกณฑ์ 2/5" in txt and "ซื้อได้แค่ไม้เล็ก" in txt and "รอ ⏳" in txt and "อยู่ในโซน" in txt
     assert "ยังไม่มีตัวไหนผ่านเกณฑ์" in "\n".join(ca.picks_block([row("A", False, 0, 1)], "🟢"))
+
+
+def test_alert_market_picks_filter_non_crypto_and_weak_trend():
+    import cycle_alert as ca
+    base = {"price": 1.0, "confidence": 0, "score": 50, "win_prob": None, "fails": [], "tags": [], "watch": False,
+            "plan": {"med": {"status": "🟡", "zone": [0.9, 1.0], "sl": 0.8, "tp1": 1.2, "tp2": 1.4}}}
+    rows = [dict(base, ticker="SPCXB", passed=False, trend=0.8, regime="UP"),   # โทเคนหุ้น → ตัด
+            dict(base, ticker="SUI", passed=False, trend=0.2, regime="TRANS"),  # เทรนด์อ่อน → ตัด
+            dict(base, ticker="AAA", passed=False, trend=0.8, regime="DOWN"),   # ขาลง → ตัด
+            dict(base, ticker="ZEC", passed=False, trend=0.6, regime="UP"),     # ผ่าน
+            dict(base, ticker="SOL", passed=True, trend=0.0, regime="TRANS", watch=True)]
+    mine, market = ca.split_picks(rows, ["SOL"], {"SUI", "AAA", "ZEC", "SOL"})
+    assert [r["ticker"] for r in market] == ["ZEC"] and [r["ticker"] for r in mine] == ["SOL"]
+    assert [r["ticker"] for r in ca.split_picks(rows, ["SOL"], None)[1]] == ["SPCXB", "ZEC"]  # ดึง CoinGecko ไม่ได้ → ไม่กรองหุ้น
+    from datetime import datetime
+    msg = ca.build_message("🟡", None, 0, 0, 1, [ca.fng_vote({"value": 50, "label": "Neutral"})], [],
+                           datetime(2026, 11, 24, tzinfo=ca.TH_TZ), [], mine)
+    assert "ไม่มีเหรียญที่แนวโน้มดีพอ" in msg

@@ -248,14 +248,18 @@ def build_message(state: str, prev: str | None, b: int, s: int, n: int, votes: l
         for _, txt in events:
             L += ["", txt]
     L += picks_block(mine or [], state, "⭐ เหรียญของคุณ", "")
-    L += picks_block(picks or [], state)
+    if picks:
+        L += picks_block(picks, state)
+    elif mine is not None:
+        L += ["", "━━━━━━━━━━", "🏆 เหรียญน่าสนใจจากตลาด: ตอนนี้ไม่มีเหรียญที่แนวโน้มดีพอ",
+              "(กรองเฉพาะคริปโตจริง · ไม่ใช่ขาลง · อยู่ในเทรนด์อย่างน้อย 3/5 หรือผ่านเกณฑ์ครบ) → ถือเงินสด/รอดีกว่าฝืนซื้อ"]
     L += ["", "⚠️ ไม่มีใครทำนายตลาดได้แน่นอน แบ่งเงินซื้อ อย่าลงก้อนเดียว · ไม่ใช่คำแนะนำการลงทุน"]
     return "\n".join(L)
 
 
 # ═══════════════════════ เหรียญแนะนำ (คัดจากตลาดด้วย indicator ของแอป) ═══════════════════════
 N_PICKS = 5          # แสดงสูงสุดกี่เหรียญ
-N_CANDIDATES = 10    # คัดจาก Scanner กี่เหรียญมาวิเคราะห์ละเอียด
+N_CANDIDATES = 15    # คัดจาก Scanner กี่เหรียญมาวิเคราะห์ละเอียด (เผื่อโดนกรองหุ้น/เทรนด์อ่อนออก)
 
 
 def pick_verdict(passed: bool, state: str) -> str:
@@ -305,6 +309,7 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
                          "confidence": sig.confidence if sig else 0.0, "score": c["score"],
                          "win_prob": sig.win_prob if sig else None, "fails": fails[:2],
                          "tags": (scan["tags"].get(s) or [])[:2], "watch": c["ticker"] in watch,
+                         "trend": (c.get("mom") or {}).get("trend"), "regime": c["cf"]["regime"],
                          "plan": {"date": "", "price": c["price"],
                                   "med": {"status": m["status"], "zone": [float(m["zone"][0]), float(m["zone"][1])],
                                           "sl": float(m["sl"]), "tp1": float(m["tp1"]), "tp2": float(m["tp2"])},
@@ -314,14 +319,46 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
     return rows
 
 
-def split_picks(rows: list[dict], watch: list[str]) -> tuple[list[dict], list[dict]]:
-    """(เหรียญของคุณ ตามลำดับ watchlist, 5 อันดับจากตลาดที่ไม่ซ้ำกับ watchlist)"""
+MIN_TREND = 0.6  # เหรียญจากตลาดต้องอยู่ในเทรนด์ขาขึ้นอย่างน้อย 3 ใน 5 ช่วงเวลา (Donchian ensemble)
+
+
+def fetch_crypto_symbols(n_pages: int = 2) -> set[str] | None:
+    """สัญลักษณ์คริปโต 500 อันดับแรกตามมูลค่าตลาดจาก CoinGecko — ใช้คัดโทเคนหุ้น (เช่น SPCXB) และเหรียญเล็กมากออก
+    คืน None ถ้าดึงไม่ได้ (จะไม่กรองแทนที่จะตัดทุกเหรียญทิ้ง)"""
+    key = os.environ.get("COINGECKO_DEMO_KEY", "")
+    out: set[str] = set()
+    try:
+        for page in range(1, n_pages + 1):
+            r = requests.get("https://api.coingecko.com/api/v3/coins/markets", timeout=20,
+                             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page},
+                             headers={"x-cg-demo-api-key": key} if key else {})
+            r.raise_for_status()
+            out |= {(c.get("symbol") or "").upper() for c in r.json()}
+        return out or None
+    except Exception as e:  # noqa: BLE001
+        print(f"CoinGecko markets ดึงไม่สำเร็จ (ไม่กรองโทเคนหุ้นรอบนี้): {e}", file=sys.stderr)
+        return out or None
+
+
+def good_market_pick(r: dict, crypto: set[str] | None) -> bool:
+    """เหรียญจากตลาดที่จะแนะนำ: เป็นคริปโตจริง (อยู่ใน 500 อันดับ CoinGecko) + ไม่ใช่ขาลง + (ผ่านเกณฑ์ หรือ เทรนด์ ≥ 3/5)"""
+    if r.get("nodata"):
+        return False
+    if crypto is not None and r["ticker"] not in crypto:
+        return False
+    if r.get("regime") == "DOWN":
+        return False
+    return r["passed"] or (r.get("trend") or 0) >= MIN_TREND
+
+
+def split_picks(rows: list[dict], watch: list[str], crypto: set[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """(เหรียญของคุณ ตามลำดับ watchlist, สูงสุด 5 เหรียญจากตลาดที่แนวโน้มดี — ไม่ครบ 5 ก็ไม่เติม)"""
     mine = sorted([r for r in rows if r["watch"]], key=lambda r: watch.index(r["ticker"]) if r["ticker"] in watch else 99)
-    return mine, rank_picks([r for r in rows if not r["watch"]])
+    return mine, rank_picks([r for r in rows if not r["watch"] and good_market_pick(r, crypto)])
 
 
 def picks_block(picks: list[dict], state: str, title: str = "🏆 เหรียญน่าสนใจจากตลาด",
-                note: str = "คัดจาก 80 เหรียญที่ซื้อขายมากสุด ด้วย Momentum · Trend · Breakout · Backtest") -> list[str]:
+                note: str = "คัดจาก 80 เหรียญที่ซื้อขายมากสุด · เฉพาะคริปโตจริงที่แนวโน้มขาขึ้น (เทรนด์ ≥3/5)") -> list[str]:
     if not picks:
         return []
     n_ok = sum(p["passed"] for p in picks)
@@ -475,7 +512,7 @@ def main() -> None:
         rows = scan_picks(md, fng, watch)
     except Exception as e:  # noqa: BLE001 — Scanner พังไม่ทำให้การแจ้งเตือนหลักล้ม
         print(f"คัดเหรียญแนะนำไม่สำเร็จ: {e}", file=sys.stderr)
-    mine, picks = split_picks(rows, watch)
+    mine, picks = split_picks(rows, watch, fetch_crypto_symbols() if rows else None)
     new_picks = [(f"pick:{p['ticker']}:{day}", p) for p in mine + picks
                  if p["passed"] and f"pick:{p['ticker']}:{day}" not in sent]
     for _, p in new_picks:  # ให้ระบบเฝ้าโซน/เป้า/จุดตัดขาดทุนของเหรียญที่ผ่านเกณฑ์ต่อในรอบถัดไป
