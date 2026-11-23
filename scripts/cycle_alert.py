@@ -218,7 +218,8 @@ def todo_list(state: str, votes: list[dict]) -> list[str]:
 
 
 def build_message(state: str, prev: str | None, b: int, s: int, n: int, votes: list[dict],
-                  events: list[tuple[str, str]], now: datetime, picks: list[dict] | None = None) -> str:
+                  events: list[tuple[str, str]], now: datetime, picks: list[dict] | None = None,
+                  mine: list[dict] | None = None) -> str:
     L = [f"🔔 สัญญาณคริปโต {now:%d/%m %H:%M}", "", f"📊 ตลาดรวม: {STATE_HEAD[state]}"]
     if prev and prev != state:
         L.append(f"   (เปลี่ยนจาก {prev})")
@@ -246,6 +247,7 @@ def build_message(state: str, prev: str | None, b: int, s: int, n: int, votes: l
         L += ["", "━━━━━━━━━━", "🎯 รายเหรียญ (จากแผนสแกนประจำวัน)"]
         for _, txt in events:
             L += ["", txt]
+    L += picks_block(mine or [], state, "⭐ เหรียญของคุณ", "")
     L += picks_block(picks or [], state)
     L += ["", "⚠️ ไม่มีใครทำนายตลาดได้แน่นอน แบ่งเงินซื้อ อย่าลงก้อนเดียว · ไม่ใช่คำแนะนำการลงทุน"]
     return "\n".join(L)
@@ -277,7 +279,8 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
     from signals import build_signal
 
     scan = scan_universe(md, {"BTC"}, N_CANDIDATES, 20e6)
-    syms = list(dict.fromkeys([f"BTC{QUOTE}"] + scan["picks"] + [f"{w}{QUOTE}" for w in watch if w != "BTC"]))
+    targets = list(dict.fromkeys(scan["picks"] + [f"{w}{QUOTE}" for w in watch]))  # BTC วิเคราะห์ได้ถ้าอยู่ใน watchlist
+    syms = list(dict.fromkeys([f"BTC{QUOTE}"] + targets))
     fr = fetch_frames(md, syms, ("4h", "1d", "1w"))
     b = fr.get(f"BTC{QUOTE}", {})
     if "1d" not in b or "1w" not in b:
@@ -285,7 +288,7 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
     btc_d, btc_w = closed_only(add_indicators(b["1d"])), closed_only(add_indicators(b["1w"]))
     macro = macro_agent(btc_d, btc_w, {}, fng)
     rows = []
-    for s in syms[1:]:
+    for s in targets:
         try:
             c = analyze_coin(s, fr.get(s, {}), btc_d, macro, {})
             if not c:
@@ -302,19 +305,25 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
                                   "long": {}}})
         except Exception as e:  # noqa: BLE001 — เหรียญเดียวพังไม่ทำให้ทั้งรอบล้ม
             print(f"วิเคราะห์ {s} ไม่สำเร็จ: {e}", file=sys.stderr)
-    return rank_picks(rows)
+    return rows
 
 
-def picks_block(picks: list[dict], state: str) -> list[str]:
+def split_picks(rows: list[dict], watch: list[str]) -> tuple[list[dict], list[dict]]:
+    """(เหรียญของคุณ ตามลำดับ watchlist, 5 อันดับจากตลาดที่ไม่ซ้ำกับ watchlist)"""
+    mine = sorted([r for r in rows if r["watch"]], key=lambda r: watch.index(r["ticker"]) if r["ticker"] in watch else 99)
+    return mine, rank_picks([r for r in rows if not r["watch"]])
+
+
+def picks_block(picks: list[dict], state: str, title: str = "🏆 เหรียญน่าสนใจจากตลาด",
+                note: str = "คัดจาก 80 เหรียญที่ซื้อขายมากสุด ด้วย Momentum · Trend · Breakout · Backtest") -> list[str]:
     if not picks:
         return []
     n_ok = sum(p["passed"] for p in picks)
-    L = ["", "━━━━━━━━━━", f"🏆 เหรียญน่าสนใจตอนนี้ (ผ่านเกณฑ์ {n_ok}/{len(picks)})",
-         "คัดจาก 80 เหรียญที่ซื้อขายมากสุด ด้วย Momentum · Trend · Breakout · Backtest"]
+    L = ["", "━━━━━━━━━━", f"{title} (ผ่านเกณฑ์ {n_ok}/{len(picks)})"] + ([note] if note else [])
     for i, p in enumerate(picks, 1):
         m = p["plan"]["med"]
         lo, hi = m["zone"]
-        L += ["", f"{i}. {p['ticker']}{' ⭐' if p['watch'] else ''}: {pick_verdict(p['passed'], state)}"]
+        L += ["", f"{i}. {p['ticker']}: {pick_verdict(p['passed'], state)}"]
         where = "อยู่ในโซน" if m["sl"] < p["price"] <= hi else ("สูงกว่าโซน ตั้งรอซื้อ" if p["price"] > hi else "ต่ำกว่าโซน")
         L.append(f"   ราคา {_p(p['price'])} · โซนซื้อ {_p(lo)}–{_p(hi)} ({where})")
         L.append(f"   ขายทำกำไร {_p(m['tp1'])} · ตัดขาดทุนถ้าต่ำกว่า {_p(m['sl'])}")
@@ -326,7 +335,7 @@ def picks_block(picks: list[dict], state: str) -> list[str]:
         if p["tags"]:
             L.append(f"   จุดเด่น: {' · '.join(p['tags'])}")
     if n_ok == 0:
-        L += ["", "ตอนนี้ยังไม่มีเหรียญผ่านเกณฑ์ครบ → ตั้งรอที่โซนซื้อ ระบบจะแจ้งเมื่อผ่าน"]
+        L += ["", "ยังไม่มีตัวไหนผ่านเกณฑ์ครบ → ตั้งรอที่โซนซื้อ ระบบจะแจ้งเมื่อผ่าน"]
     return L
 
 
@@ -437,12 +446,14 @@ def main() -> None:
 
     # เหรียญแนะนำจากตลาด — เหรียญที่ "เพิ่งผ่านเกณฑ์" นับเป็นเรื่องใหม่ที่ต้องแจ้ง (ครั้งเดียวต่อวัน)
     watch = [w.strip().upper() for w in os.environ.get("SCAN_WATCH", "").split(",") if w.strip()]
-    picks: list[dict] = []
+    rows: list[dict] = []
     try:
-        picks = scan_picks(md, fng, watch)
+        rows = scan_picks(md, fng, watch)
     except Exception as e:  # noqa: BLE001 — Scanner พังไม่ทำให้การแจ้งเตือนหลักล้ม
         print(f"คัดเหรียญแนะนำไม่สำเร็จ: {e}", file=sys.stderr)
-    new_picks = [(f"pick:{p['ticker']}:{day}", p) for p in picks if p["passed"] and f"pick:{p['ticker']}:{day}" not in sent]
+    mine, picks = split_picks(rows, watch)
+    new_picks = [(f"pick:{p['ticker']}:{day}", p) for p in mine + picks
+                 if p["passed"] and f"pick:{p['ticker']}:{day}" not in sent]
     for _, p in new_picks:  # ให้ระบบเฝ้าโซน/เป้า/จุดตัดขาดทุนของเหรียญที่ผ่านเกณฑ์ต่อในรอบถัดไป
         plans[p["ticker"]] = {**p["plan"], "date": day}
     if new_picks:
@@ -451,12 +462,13 @@ def main() -> None:
     changed = prev is not None and prev != st
     first_run = prev is None
     print("\n".join(v["text"] for v in votes), f"\nสถานะ {st} (เดิม {prev}) · เหตุการณ์รายเหรียญ {len(events)}",
+          f"\nเหรียญของคุณ: {', '.join(p['ticker'] + ('✅' if p['passed'] else '') for p in mine) or '-'}",
           f"\nเหรียญแนะนำ: {', '.join(p['ticker'] + ('✅' if p['passed'] else '') for p in picks) or '-'}")
 
     if n == 0:
         print("ไม่มีข้อมูลตัวชี้วัดเลย — ไม่ส่งและไม่เปลี่ยนสถานะ", file=sys.stderr)
     elif force or changed or first_run or events or new_picks:
-        msg = build_message(st, prev, b, s, n, votes, events, now, picks)
+        msg = build_message(st, prev, b, s, n, votes, events, now, picks, mine)
         if not send_telegram(tg_token, tg_chat, msg):
             print("ส่ง Telegram ไม่สำเร็จ — ไม่บันทึกว่าส่งแล้ว", file=sys.stderr)
             save_json(STATE_FILE, state)  # ยังเก็บประวัติตัวชี้วัด แต่ไม่ mark ว่าส่งแล้ว

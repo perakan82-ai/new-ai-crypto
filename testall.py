@@ -969,6 +969,8 @@ def test_alert_picks_rank_and_block():
             row("E", False, 0, 60), row("SOL", False, 0, 20)]
     top = ca.rank_picks(rows)
     assert [r["ticker"] for r in top] == ["C", "B", "A", "E", "D"]   # ผ่านเกณฑ์ขึ้นก่อน · สูงสุด 5 ตัว
+    mine, market = ca.split_picks(rows, ["SOL"])
+    assert [r["ticker"] for r in mine] == ["SOL"] and "SOL" not in [r["ticker"] for r in market]
     txt = "\n".join(ca.picks_block(top, "🟡"))
     assert "ผ่านเกณฑ์ 2/5" in txt and "ซื้อได้แค่ไม้เล็ก" in txt and "รอ ⏳" in txt and "อยู่ในโซน" in txt
-    assert "ยังไม่มีเหรียญผ่านเกณฑ์" in "\n".join(ca.picks_block([row("A", False, 0, 1)], "🟢"))
+    assert "ยังไม่มีตัวไหนผ่านเกณฑ์" in "\n".join(ca.picks_block([row("A", False, 0, 1)], "🟢"))
