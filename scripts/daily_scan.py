@@ -103,6 +103,43 @@ def send_telegram(token: str, chat_id: str, text: str, html_mode: bool = False) 
     return ok_all
 
 
+PLANS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "plans.json")
+
+
+def plan_snapshot(c: dict, day: str) -> dict:
+    """ตัดเฉพาะตัวเลขแผนที่ cycle_alert.py ใช้เช็ก trigger (โซนซื้อ/SL/TP/DCA)"""
+    m, lg = c.get("med") or {}, c.get("long") or {}
+    f = lambda x: float(x) if x is not None else None  # noqa: E731
+    return {"date": day, "price": f(c.get("price")),
+            "med": {"status": m.get("status"), "zone": [f(m["zone"][0]), f(m["zone"][1])], "sl": f(m.get("sl")),
+                    "tp1": f(m.get("tp1")), "tp2": f(m.get("tp2"))} if m.get("zone") else {},
+            "long": {"status": lg.get("status"), "tiers": [f(t) for t in lg.get("tiers") or []],
+                     "stop": f(lg.get("stop"))} if lg else {}}
+
+
+def save_plans(res: dict, watch: list[str], path: str = PLANS_FILE) -> dict:
+    """บันทึกแผนของเหรียญใน SCAN_WATCH + เหรียญที่ระบบคัด ลง data/plans.json
+    (รวมกับของเดิม: เหรียญที่วันนี้ไม่ได้วิเคราะห์ ยังใช้แผนล่าสุดของมันต่อ — cycle_alert ตัดแผนที่เก่าเกิน 7 วันทิ้งเอง)"""
+    import json
+    try:
+        with open(path, encoding="utf-8") as fh:
+            plans = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        plans = {}
+    day = datetime.now(TH_TZ).strftime("%Y-%m-%d")
+    picked = {p["ticker"] for p in (res.get("port") or {}).get("picks", [])}
+    for c in res.get("coins", []):
+        if c.get("ticker") in set(watch) | picked:
+            try:
+                plans[c["ticker"]] = plan_snapshot(c, day)
+            except (KeyError, TypeError, IndexError) as e:
+                print(f"บันทึกแผน {c.get('ticker')} ไม่สำเร็จ: {e}", file=sys.stderr)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(plans, fh, ensure_ascii=False, indent=1)
+    return plans
+
+
 def main() -> None:
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -132,6 +169,12 @@ def main() -> None:
         err = f"⚠️ สแกนประจำวันล้มเหลว: {e}\n\n" + traceback.format_exc()[-1500:]
         send_telegram(tg_token, tg_chat, err)
         raise
+
+    try:  # แผนสำหรับระบบแจ้งเตือนทุก 4 ชม. — พังก็ไม่ทำให้สแกนหลักล้ม
+        saved = save_plans(res, coins)
+        print(f"บันทึกแผนสำหรับแจ้งเตือน: {', '.join(saved) or '-'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"บันทึก data/plans.json ไม่สำเร็จ: {e}", file=sys.stderr)
 
     pretty = format_for_telegram(text)
     if not send_telegram(tg_token, tg_chat, pretty, html_mode=True):

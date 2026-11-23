@@ -1,0 +1,53 @@
+name: Crypto Buy/Sell Alert
+
+on:
+  schedule:
+    # ทุก 4 ชม. ที่นาที 17 (UTC) = 01:17, 05:17, 09:17, 13:17, 17:17, 21:17 เวลาไทย
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "ส่งสรุปเข้า Telegram แม้สถานะไม่เปลี่ยน (ใช้ทดสอบ)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # บันทึก data/alert_state.json กลับเข้า repo
+
+concurrency:
+  group: repo-data   # ใช้กลุ่มเดียวกับ Daily Crypto Scan กัน push ชนกัน
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check market & send alerts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
+          COINGECKO_DEMO_KEY: ${{ secrets.COINGECKO_DEMO_KEY }}
+          FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
+        run: python scripts/cycle_alert.py
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          mkdir -p data && git add data/
+          if git diff --cached --quiet; then echo "ไม่มีอะไรเปลี่ยน"; exit 0; fi
+          git commit -m "chore: update alert state [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push
