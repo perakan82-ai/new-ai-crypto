@@ -292,6 +292,12 @@ def scan_picks(md, fng: dict | None, watch: list[str]) -> list[dict]:
         try:
             c = analyze_coin(s, fr.get(s, {}), btc_d, macro, {})
             if not c:
+                t = s[: -len(QUOTE)]
+                if t in watch:  # เหรียญของคุณที่วิเคราะห์ไม่ได้ ต้องบอก ไม่ใช่หายไปเฉย ๆ
+                    n1d = len(fr.get(s, {}).get("1d", []))
+                    rows.append({"ticker": t, "watch": True, "nodata": True, "passed": False, "score": 0, "confidence": 0,
+                                 "why": f"ข้อมูลรายวันบน Binance Spot มี {n1d} แท่ง ไม่พอวิเคราะห์" if n1d
+                                 else "ไม่พบคู่ USDT บน Binance Spot"})
                 continue
             sig, fails = build_signal(c, macro)
             m = c["med"]
@@ -321,6 +327,9 @@ def picks_block(picks: list[dict], state: str, title: str = "🏆 เหรี�
     n_ok = sum(p["passed"] for p in picks)
     L = ["", "━━━━━━━━━━", f"{title} (ผ่านเกณฑ์ {n_ok}/{len(picks)})"] + ([note] if note else [])
     for i, p in enumerate(picks, 1):
+        if p.get("nodata"):
+            L += ["", f"{i}. {p['ticker']}: วิเคราะห์ไม่ได้ ❔", f"   {p['why']}"]
+            continue
         m = p["plan"]["med"]
         lo, hi = m["zone"]
         L += ["", f"{i}. {p['ticker']}: {pick_verdict(p['passed'], state)}"]
