@@ -93,7 +93,7 @@ def usdt_vote(value: float | None, hist: list) -> dict:
 def oi_vote(ratio: float | None, oi_hist: list) -> dict:
     """ratio = alt OI / BTC OI · oi_hist = [[day, ratio], ...] รวมวันนี้แล้ว"""
     if ratio is None:
-        return _v("Alt OI", None, False, "เงินกู้ใน Altcoin เทียบ Bitcoin: ยังไม่มีข้อมูล (ต้องใส่ COINALYZE_API_KEY)")
+        return _v("Alt OI", None, False, "เงินกู้ใน Altcoin เทียบ Bitcoin: ยังไม่มีข้อมูล (ไม่มี COINALYZE_API_KEY หรือดึงไม่สำเร็จ)")
     streak = 0
     for _, r in reversed(oi_hist):
         if r > 1:
@@ -363,30 +363,45 @@ def fetch_usdt_dom() -> float | None:
         return None
 
 
+def _coinalyze_get(url: str, hdr: dict, params: dict | None = None, tries: int = 4):
+    """GET พร้อมรอตาม Retry-After เมื่อโดนจำกัด (429) — ฟรี 40 ครั้ง/นาที/key"""
+    import time
+    for i in range(tries):
+        r = requests.get(url, headers=hdr, params=params, timeout=30)
+        if r.status_code == 429 and i < tries - 1:
+            time.sleep(min(float(r.headers.get("Retry-After") or 10) + 1, 65))
+            continue
+        r.raise_for_status()
+        return r.json()
+    return None
+
+
 def fetch_oi_ratio() -> float | None:
-    """alt OI (ไม่รวม BTC, ETH) / BTC OI จาก Coinalyze — เฉพาะ perpetual บน Binance (exchange code A) หน่วย USD"""
+    """alt OI (ไม่รวม BTC, ETH) / BTC OI จาก Coinalyze — เฉพาะ perpetual USDT บน Binance (exchange code A) หน่วย USD
+    ส่งทีละ 20 symbols และเว้น 1.6 วินาที/ครั้ง ให้อยู่ใต้เพดาน 40 ครั้ง/นาที"""
+    import time
     key = os.environ.get("COINALYZE_API_KEY", "")
     if not key:
         return None
     base, hdr = "https://api.coinalyze.net/v1", {"api_key": key}
     try:
-        mk = requests.get(f"{base}/future-markets", headers=hdr, timeout=30)
-        mk.raise_for_status()
-        syms = [(m["symbol"], (m.get("base_asset") or "").upper()) for m in mk.json()
-                if m.get("is_perpetual") and m.get("exchange") == "A"]
+        markets = _coinalyze_get(f"{base}/future-markets", hdr) or []
+        syms = [(m["symbol"], (m.get("base_asset") or "").upper()) for m in markets
+                if m.get("is_perpetual") and m.get("exchange") == "A" and (m.get("quote_asset") or "").upper() == "USDT"]
         asset = dict(syms)
-        btc = alt = 0.0
         names = [s for s, _ in syms]
-        for i in range(0, len(names), 20):  # สูงสุด 20 symbols ต่อครั้ง · จำกัด 40 ครั้ง/นาที
-            r = requests.get(f"{base}/open-interest", headers=hdr, timeout=30,
-                             params={"symbols": ",".join(names[i:i + 20]), "convert_to_usd": "true"})
-            r.raise_for_status()
-            for row in r.json():
+        btc = alt = 0.0
+        for i in range(0, len(names), 20):
+            time.sleep(1.6)
+            rows = _coinalyze_get(f"{base}/open-interest", hdr,
+                                  {"symbols": ",".join(names[i:i + 20]), "convert_to_usd": "true"}) or []
+            for row in rows:
                 a, v = asset.get(row.get("symbol"), ""), float(row.get("value") or 0)
                 if a == "BTC":
                     btc += v
                 elif a != "ETH":
                     alt += v
+        print(f"Coinalyze: {len(names)} สัญญา · BTC OI ${btc / 1e9:.2f}b · Alt OI ${alt / 1e9:.2f}b")
         return alt / btc if btc > 0 else None
     except Exception as e:  # noqa: BLE001
         print(f"Coinalyze ดึงไม่สำเร็จ: {e}", file=sys.stderr)
