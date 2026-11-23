@@ -21,7 +21,7 @@ concurrency:
 jobs:
   alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +38,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COINALYZE_API_KEY: ${{ secrets.COINALYZE_API_KEY }}
           COINGECKO_DEMO_KEY: ${{ secrets.COINGECKO_DEMO_KEY }}
+          SCAN_WATCH: ${{ secrets.SCAN_WATCH }}
           FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' && inputs.force && '1' || '' }}
         run: python scripts/cycle_alert.py
 

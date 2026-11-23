@@ -957,3 +957,18 @@ def test_alert_buy_verdict_follows_market_state():
     st, b, s, n = ca.market_state(votes)
     msg = ca.build_message(st, None, b, s, n, votes, [], now)
     assert st == "🟡" and "ทำไมสัญญาณขัดกัน" in msg and "ยังไม่ไล่ซื้อ Altcoin" in msg and "ไม่มีข้อมูล" in msg
+
+
+def test_alert_picks_rank_and_block():
+    import cycle_alert as ca
+    def row(t, passed, conf, score, price=10.0):
+        return {"ticker": t, "price": price, "passed": passed, "confidence": conf, "score": score, "win_prob": 62.0,
+                "fails": [] if passed else ["Regime ขาลง"], "tags": ["Breakout 20 แท่ง"], "watch": t == "SOL",
+                "plan": {"med": {"status": "🟢", "zone": [9.5, 10.2], "sl": 9.0, "tp1": 12.0, "tp2": 14.0}}}
+    rows = [row("A", False, 0, 90), row("B", True, 55, 10), row("C", True, 70, 5), row("D", False, 0, 40),
+            row("E", False, 0, 60), row("SOL", False, 0, 20)]
+    top = ca.rank_picks(rows)
+    assert [r["ticker"] for r in top] == ["C", "B", "A", "E", "D"]   # ผ่านเกณฑ์ขึ้นก่อน · สูงสุด 5 ตัว
+    txt = "\n".join(ca.picks_block(top, "🟡"))
+    assert "ผ่านเกณฑ์ 2/5" in txt and "ซื้อได้แค่ไม้เล็ก" in txt and "รอ ⏳" in txt and "อยู่ในโซน" in txt
+    assert "ยังไม่มีเหรียญผ่านเกณฑ์" in "\n".join(ca.picks_block([row("A", False, 0, 1)], "🟢"))
