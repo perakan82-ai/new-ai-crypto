@@ -943,3 +943,17 @@ def test_daily_scan_save_plans(tmp_path):
     assert set(out) == {"SOL"} and out["SOL"]["med"]["zone"] == [130.0, 135.0]
     import cycle_alert as ca
     assert ca.load_json(p, {})["SOL"]["long"]["tiers"] == [125.0, 110.0, 95.0]
+
+
+def test_alert_buy_verdict_follows_market_state():
+    from datetime import datetime
+    import cycle_alert as ca
+    now = datetime(2026, 11, 23, 12, tzinfo=ca.TH_TZ)
+    plans = {"SOL": {"date": "2026-11-22", "med": {"status": "🟡", "zone": [130, 135], "sl": 120, "tp1": 150, "tp2": 170}}}
+    txt = {st: ca.coin_events(plans, {"SOL": 133}, {}, now, st)[0][1] for st in ("🟢", "🟡", "🔴")}
+    assert "ซื้อได้เลย" in txt["🟢"] and "ไม้เล็ก" in txt["🟡"] and "ยังไม่ควรซื้อ" in txt["🔴"]
+    votes = [ca.usdt_vote(8.4, []), ca.oi_vote(1.2, [[str(i), 1.2] for i in range(8)]),
+             ca.fng_vote({"value": 12, "label": "Extreme Fear"}), ca.regime_vote(None)]
+    st, b, s, n = ca.market_state(votes)
+    msg = ca.build_message(st, None, b, s, n, votes, [], now)
+    assert st == "🟡" and "ทำไมสัญญาณขัดกัน" in msg and "ยังไม่ไล่ซื้อ Altcoin" in msg and "ไม่มีข้อมูล" in msg

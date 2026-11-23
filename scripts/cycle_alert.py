@@ -44,8 +44,6 @@ USDT_FALLBACK = (8.0, 6.0)  # (ฝั่งซื้อ ≥, ฝั่งขา�
 OI_STREAK_DAYS = 7          # alt OI > BTC OI ติดต่อกันกี่วันถึงนับเป็นฝั่งขาย
 OI_FLUSH_DROP = 0.25        # ratio ลดลง ≥25% จากจุดสูงสุด 3 วัน = leverage ถูกล้าง → ฝั่งซื้อ
 PLAN_MAX_AGE_D = 7          # แผนเก่ากว่านี้ไม่ใช้แจ้งเตือน
-STATE_TXT = {"🟢": "โซนสะสม (ทยอยซื้อได้ตามแผน)", "🟡": "สัญญาณผสม (ทำตามแผนรายเหรียญ ไม่ไล่ราคา)",
-             "🔴": "ตลาดร้อน/เสี่ยง (ลดสัดส่วน altcoin · ทำแผนขาย)"}
 
 
 # ═══════════════════════ state ═══════════════════════
@@ -69,24 +67,33 @@ def upsert_daily(hist: list, day: str, value: float, keep: int = HISTORY_KEEP) -
 
 
 # ═══════════════════════ votes (pure functions — ทดสอบได้) ═══════════════════════
+def _v(name: str, vote: str | None, ok: bool, plain: str, act: str = "", tech: str = "") -> dict:
+    """ผลของตัวชี้วัด 1 ตัว · plain = อธิบายภาษาง่าย · act = ควรทำอะไร · tech = ตัวเลขเทคนิค (ไว้ใน log)"""
+    return {"name": name, "vote": vote, "ok": ok, "plain": plain, "act": act, "text": f"{name}: {tech or plain}"}
+
+
 def usdt_vote(value: float | None, hist: list) -> dict:
+    """USDT dominance สูง = คนขายเหรียญไปถือเงินสด (กลัว) → ฝั่งซื้อ · ต่ำ = เงินลงตลาดหมดแล้ว → ฝั่งขาย"""
     if value is None:
-        return {"vote": None, "ok": False, "text": "USDT.D: ไม่มีข้อมูล"}
+        return _v("USDT.D", None, False, "สัดส่วนเงินสด USDT: ดึงข้อมูลไม่ได้")
     vals = [v for _, v in hist]
     if len(vals) >= MIN_HISTORY:
         pct = sum(v <= value for v in vals) / len(vals)
         vote = "buy" if pct >= 0.8 else ("sell" if pct <= 0.2 else None)
-        basis = f"percentile {pct * 100:.0f}% ของ {len(vals)} วัน"
+        basis = f"สูงกว่า {pct * 100:.0f}% ของ {len(vals)} วันที่ผ่านมา"
     else:
         vote = "buy" if value >= USDT_FALLBACK[0] else ("sell" if value <= USDT_FALLBACK[1] else None)
-        basis = f"เกณฑ์ชั่วคราว ≥{USDT_FALLBACK[0]}%/≤{USDT_FALLBACK[1]}% (เก็บประวัติแล้ว {len(vals)}/{MIN_HISTORY} วัน)"
-    return {"vote": vote, "ok": True, "text": f"USDT.D {value:.2f}% · {basis}"}
+        basis = f"ใช้เกณฑ์ชั่วคราว ≥{USDT_FALLBACK[0]:g}% · เก็บประวัติแล้ว {len(vals)}/{MIN_HISTORY} วัน"
+    plain = {"buy": f"คนถือเงินสด USDT สูง {value:.2f}% ({basis})",
+             "sell": f"คนถือเงินสด USDT ต่ำ {value:.2f}% ({basis})"}.get(vote, f"เงินสด USDT {value:.2f}% ปกติ ({basis})")
+    act = {"buy": "คนกลัวและรอซื้อ มักเป็นจังหวะเริ่มสะสม", "sell": "เงินลงตลาดไปเยอะแล้ว ระวังยอด"}.get(vote, "")
+    return _v("USDT.D", vote, True, plain, act, f"{value:.2f}% · {basis}")
 
 
 def oi_vote(ratio: float | None, oi_hist: list) -> dict:
     """ratio = alt OI / BTC OI · oi_hist = [[day, ratio], ...] รวมวันนี้แล้ว"""
     if ratio is None:
-        return {"vote": None, "ok": False, "text": "Alt OI/BTC OI: ไม่มีข้อมูล (ยังไม่ได้ใส่ COINALYZE_API_KEY หรือดึงไม่สำเร็จ)"}
+        return _v("Alt OI", None, False, "เงินกู้ใน Altcoin เทียบ Bitcoin: ยังไม่มีข้อมูล (ต้องใส่ COINALYZE_API_KEY)")
     streak = 0
     for _, r in reversed(oi_hist):
         if r > 1:
@@ -96,27 +103,35 @@ def oi_vote(ratio: float | None, oi_hist: list) -> dict:
     recent = [r for _, r in oi_hist[-4:-1]]  # 3 วันก่อนหน้า
     peak = max(recent) if recent else None
     if streak >= OI_STREAK_DAYS:
-        vote, why = "sell", f"alt > BTC ติดต่อกัน {streak} วัน"
-    elif peak and peak > 0 and ratio <= peak * (1 - OI_FLUSH_DROP):
-        vote, why = "buy", f"ลดลง {(1 - ratio / peak) * 100:.0f}% จากจุดสูงสุด 3 วัน (leverage ถูกล้าง)"
-    else:
-        vote, why = None, (f"alt > BTC มา {streak} วัน" if streak else "alt < BTC")
-    return {"vote": vote, "ok": True, "text": f"Alt OI/BTC OI {ratio:.2f}x · {why}"}
+        return _v("Alt OI", "sell", True, f"คนกู้เงินมาเล่น Altcoin มากกว่า Bitcoin ติดต่อกัน {streak} วัน ({ratio:.2f} เท่า)",
+                  "ร้อนเกินไป เสี่ยงร่วงแรง ควรขาย Altcoin บางส่วน", f"{ratio:.2f}x · alt > BTC {streak} วัน")
+    if peak and peak > 0 and ratio <= peak * (1 - OI_FLUSH_DROP):
+        drop = (1 - ratio / peak) * 100
+        return _v("Alt OI", "buy", True, f"เงินกู้ใน Altcoin เพิ่งถูกล้างไป {drop:.0f}% ใน 3 วัน",
+                  "แรงขายจากคนติดหนี้หมดไปแล้ว มักเป็นจังหวะเข้า", f"{ratio:.2f}x · ลด {drop:.0f}%")
+    why = f"สูงกว่า Bitcoin มา {streak} วัน ยังไม่ถึง {OI_STREAK_DAYS} วัน" if streak else "ต่ำกว่า Bitcoin"
+    return _v("Alt OI", None, True, f"เงินกู้ใน Altcoin {ratio:.2f} เท่าของ Bitcoin ({why})", "", f"{ratio:.2f}x · {why}")
 
 
 def fng_vote(fng: dict | None) -> dict:
     if not fng:
-        return {"vote": None, "ok": False, "text": "Fear & Greed: ไม่มีข้อมูล"}
+        return _v("F&G", None, False, "ดัชนีความกลัว/โลภ: ดึงข้อมูลไม่ได้")
     v = fng["value"]
-    vote = "buy" if v <= 20 else ("sell" if v >= 75 else None)
-    return {"vote": vote, "ok": True, "text": f"Fear & Greed {v} ({fng['label']})"}
+    if v <= 20:
+        return _v("F&G", "buy", True, f"ดัชนีความกลัว {v} (กลัวสุดขีด)", "คนตื่นตระหนก มักเป็นจังหวะสะสม", f"{v} {fng['label']}")
+    if v >= 75:
+        return _v("F&G", "sell", True, f"ดัชนีความโลภ {v} (โลภสุดขีด)", "คนไล่ราคา ระวังยอด", f"{v} {fng['label']}")
+    return _v("F&G", None, True, f"ดัชนีความกลัว/โลภ {v} (ปกติ)", "", f"{v} {fng['label']}")
 
 
 def regime_vote(regime: str | None) -> dict:
     if not regime:
-        return {"vote": None, "ok": False, "text": "BTC regime: ไม่มีข้อมูล"}
-    vote = {"Bull": "buy", "Bear": "sell"}.get(regime)
-    return {"vote": vote, "ok": True, "text": f"BTC regime {regime}"}
+        return _v("BTC", None, False, "แนวโน้ม Bitcoin: ดึงข้อมูลไม่ได้")
+    if regime == "Bull":
+        return _v("BTC", "buy", True, "Bitcoin เป็นขาขึ้น (เหนือเส้นค่าเฉลี่ย 200 วัน)", "ตลาดหลักยังแข็ง", regime)
+    if regime == "Bear":
+        return _v("BTC", "sell", True, "Bitcoin เป็นขาลง (ต่ำกว่าเส้นค่าเฉลี่ย 200 วัน)", "ตลาดหลักยังอ่อน อย่าลงเงินเยอะ", regime)
+    return _v("BTC", None, True, "Bitcoin กำลังเปลี่ยนทิศ (ยังไม่ชัด)", "", regime)
 
 
 def market_state(votes: list[dict]) -> tuple[str, int, int, int]:
@@ -133,9 +148,21 @@ def market_state(votes: list[dict]) -> tuple[str, int, int, int]:
     return st, b, s, n
 
 
-def coin_events(plans: dict, prices: dict, sent: dict, today: datetime) -> list[tuple[str, str]]:
-    """คืน [(key, ข้อความ)] ของเหตุการณ์ใหม่ที่ยังไม่เคยส่ง · key ผูกกับวันที่ของแผน จึงส่งครั้งเดียวต่อแผน"""
+def _p(x: float) -> str:
+    return f"{x:,.6g}"
+
+
+# ระดับการซื้อตามสีตลาด (ใช้กับ "เข้าโซนซื้อ" และ "ถึงไม้ DCA")
+BUY_VERDICT = {"🟢": ("ซื้อได้เลย ✅", "ผ่านเกณฑ์ครบ: ราคาเข้าโซน + ตลาดรวมเขียว"),
+               "🟡": ("ซื้อได้แค่ไม้เล็ก 🟡", "ราคาเข้าโซน แต่ตลาดรวมยังผสม → ใช้เงินแค่ ⅓ ของที่ตั้งใจ"),
+               "🔴": ("ยังไม่ควรซื้อ ⛔", "ราคาเข้าโซน แต่ตลาดรวมแดง → รอให้ตลาดดีขึ้นก่อน")}
+
+
+def coin_events(plans: dict, prices: dict, sent: dict, today: datetime, state: str = "🟡") -> list[tuple[str, str]]:
+    """คืน [(key, ข้อความ)] ของเหตุการณ์ใหม่ที่ยังไม่เคยส่ง · key ผูกกับวันที่ของแผน จึงส่งครั้งเดียวต่อแผน
+    ข้อความฝั่งซื้อปรับตามสีตลาดรวม (state) — ราคาเข้าโซนอย่างเดียวไม่พอจะบอกว่า "ซื้อได้เลย" """
     out = []
+    verdict, why = BUY_VERDICT[state]
     for t, p in plans.items():
         px = prices.get(t)
         if px is None:
@@ -151,17 +178,21 @@ def coin_events(plans: dict, prices: dict, sent: dict, today: datetime) -> list[
         if m and m.get("status") != "🔴":
             lo, hi = m["zone"]
             checks += [
-                ("sl", px <= m["sl"], f"🛑 {t} หลุด SL {m['sl']:.6g} (ราคา {px:.6g}) → ทำตามแผนตัดขาดทุน"),
-                ("tp2", px >= m["tp2"], f"🚀 {t} แตะ TP2 {m['tp2']:.6g} (ราคา {px:.6g}) → ขายส่วนที่เหลือตามแผน"),
-                ("tp1", px >= m["tp1"], f"✅ {t} แตะ TP1 {m['tp1']:.6g} (ราคา {px:.6g}) → ขายบางส่วน + เลื่อน SL มาที่ทุน"),
-                ("zone", m["sl"] < px <= hi, f"🟦 {t} เข้าโซนซื้อ {lo:.6g}–{hi:.6g} (ราคา {px:.6g}) · SL {m['sl']:.6g} · TP1 {m['tp1']:.6g}"),
+                ("sl", px <= m["sl"], f"🪙 {t}: ตัดขาดทุน 🛑\n   ราคา {_p(px)} ต่ำกว่าจุดตัดขาดทุน {_p(m['sl'])}\n   → ขายตามแผน อย่าถัวเพิ่ม"),
+                ("tp2", px >= m["tp2"], f"🪙 {t}: ขายส่วนที่เหลือได้แล้ว 🚀\n   ราคา {_p(px)} แตะเป้าที่ 2 ({_p(m['tp2'])})"),
+                ("tp1", px >= m["tp1"], f"🪙 {t}: ขายครึ่งหนึ่งได้แล้ว 💰\n   ราคา {_p(px)} แตะเป้าแรก ({_p(m['tp1'])})\n"
+                                        f"   → ที่เหลือเลื่อนจุดตัดขาดทุนมาที่ราคาทุน · เป้าถัดไป {_p(m['tp2'])}"),
+                ("zone", m["sl"] < px <= hi, f"🪙 {t}: {verdict}\n   ราคา {_p(px)} อยู่ในโซนซื้อ {_p(lo)}–{_p(hi)}\n"
+                                             f"   ขายทำกำไร {_p(m['tp1'])} · ตัดขาดทุนถ้าต่ำกว่า {_p(m['sl'])}\n   ({why})"),
             ]
         if lg and lg.get("status") != "🔴":
             for i, tier in enumerate(lg.get("tiers") or []):
-                checks.append((f"dca{i + 1}", px <= tier, f"🏦 {t} ถึงไม้ DCA {i + 1} ที่ {tier:.6g} (ราคา {px:.6g})"))
+                checks.append((f"dca{i + 1}", px <= tier,
+                               f"🪙 {t} (ถือยาว): สะสมไม้ที่ {i + 1} — {verdict}\n   ราคา {_p(px)} ถึงจุดซื้อสะสม {_p(tier)}"))
             if lg.get("stop"):
                 checks.append(("lstop", px <= lg["stop"],
-                               f"⚠️ {t} ต่ำกว่าจุดตัดขาดทุนระยะยาว {lg['stop']:.6g} — ยืนยันด้วยแท่งปิดรายสัปดาห์ก่อนขาย"))
+                               f"🪙 {t} (ถือยาว): ระวัง ⚠️\n   ราคา {_p(px)} ต่ำกว่าจุดยอมแพ้ระยะยาว {_p(lg['stop'])}\n"
+                               "   → ถ้าแท่งรายสัปดาห์ปิดต่ำกว่านี้ ให้ขาย"))
         for name, hit, text in checks:
             key = f"{t}:{p['date']}:{name}"
             if hit and key not in sent:
@@ -169,17 +200,53 @@ def coin_events(plans: dict, prices: dict, sent: dict, today: datetime) -> list[
     return out
 
 
+STATE_HEAD = {"🟢": "🟢 ดี — ทยอยซื้อตามแผนได้", "🟡": "🟡 ระวัง — ซื้อได้ทีละน้อย", "🔴": "🔴 ร้อน/เสี่ยง — ไม่ซื้อเพิ่ม ทำแผนขาย"}
+
+
+def todo_list(state: str, votes: list[dict]) -> list[str]:
+    alt_hot = any(v["name"] == "Alt OI" and v["vote"] == "sell" for v in votes)
+    if state == "🟢":
+        out = ["ซื้อตามแผนได้ แบ่ง 2–3 ไม้"]
+        out.append("ยังไม่ไล่ซื้อ Altcoin (เงินกู้ใน Alt สูง)" if alt_hot else "Altcoin ซื้อได้เฉพาะตัวที่ราคาเข้าโซน")
+    elif state == "🟡":
+        out = ["ซื้อ BTC / ETH ได้ แบ่งไม้เล็ก ๆ", "ยังไม่ไล่ซื้อ Altcoin"]
+        if alt_hot:
+            out.append("ถ้าถือ Altcoin ที่มีกำไร ขายบางส่วนได้")
+    else:
+        out = ["ไม่ซื้อเพิ่ม", "ขาย Altcoin บางส่วน / ทำตามแผนขาย", "เก็บเงินสดไว้รอจังหวะ"]
+    return out
+
+
 def build_message(state: str, prev: str | None, b: int, s: int, n: int, votes: list[dict],
                   events: list[tuple[str, str]], now: datetime) -> str:
-    L = [f"🔔 Crypto Alert {now:%d/%m %H:%M}"]
-    head = f"ตลาดรวม: {state} {STATE_TXT[state]}"
+    L = [f"🔔 สัญญาณคริปโต {now:%d/%m %H:%M}", "", f"📊 ตลาดรวม: {STATE_HEAD[state]}"]
     if prev and prev != state:
-        head += f"  (เปลี่ยนจาก {prev})"
-    L += [head, f"ฝั่งซื้อ {b} · ฝั่งขาย {s} · จากตัวชี้วัดที่มีข้อมูล {n}/{len(votes)}"]
-    L += [f"• {v['text']}" + {"buy": " → ฝั่งซื้อ", "sell": " → ฝั่งขาย"}.get(v["vote"], "") for v in votes]
+        L.append(f"   (เปลี่ยนจาก {prev})")
+    L.append(f"   สัญญาณซื้อ {b} · ขาย {s} · จากที่มีข้อมูล {n}/{len(votes)} ตัว")
+    groups = (("🔴 สัญญาณขาย", "sell"), ("🟢 สัญญาณซื้อ", "buy"))
+    for title, side in groups:
+        vs = [v for v in votes if v["vote"] == side]
+        if vs:
+            L += ["", title]
+            for v in vs:
+                L.append(f"• {v['plain']}")
+                if v["act"]:
+                    L.append(f"  → {v['act']}")
+    neutral = [v for v in votes if v["ok"] and v["vote"] is None]
+    if neutral:
+        L += ["", "⚪ ปกติ (ไม่นับ)"] + [f"• {v['plain']}" for v in neutral]
+    missing = [v for v in votes if not v["ok"]]
+    if missing:
+        L += ["", "❔ ไม่มีข้อมูล"] + [f"• {v['plain']}" for v in missing]
+    if b and s:
+        L += ["", "ℹ️ ทำไมสัญญาณขัดกัน: แต่ละตัววัดคนละเรื่อง (เงินกู้ = ร้อนเกินไปไหม · เงินสด/ความกลัว = เย็นเกินไปไหม"
+                  " · Bitcoin = แนวโน้ม) มักเกิดคนละจังหวะ ระบบนับเสียงข้างมากเป็นสีตลาดรวม → ทำตาม 👉 ด้านล่าง"]
+    L += ["", "👉 ควรทำอะไร"] + [f"• {x}" for x in todo_list(state, votes)]
     if events:
-        L += ["", "🎯 รายเหรียญ (แผนจากสแกนประจำวัน)"] + [f"• {txt}" for _, txt in events]
-    L += ["", "⚠️ ข้อมูลประกอบการตัดสินใจ ไม่ใช่คำแนะนำการลงทุน"]
+        L += ["", "━━━━━━━━━━", "🎯 รายเหรียญ (จากแผนสแกนประจำวัน)"]
+        for _, txt in events:
+            L += ["", txt]
+    L += ["", "⚠️ ไม่มีใครทำนายตลาดได้แน่นอน แบ่งเงินซื้อ อย่าลงก้อนเดียว · ไม่ใช่คำแนะนำการลงทุน"]
     return "\n".join(L)
 
 
@@ -282,7 +349,7 @@ def main() -> None:
         try:
             tk = md.tickers()
             prices = {sym[:-4]: float(tk.loc[sym, "lastPrice"]) for sym in tk.index if sym[:-4] in plans}
-            events = coin_events(plans, prices, sent, now)
+            events = coin_events(plans, prices, sent, now, st)
         except Exception as e:  # noqa: BLE001
             print(f"เช็กราคารายเหรียญไม่สำเร็จ: {e}", file=sys.stderr)
 
