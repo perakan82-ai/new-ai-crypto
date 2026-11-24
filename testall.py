@@ -734,12 +734,12 @@ def test_model_discovery_and_chain():
                         M("gemini-3.9-flash-preview"), M("gemini-3.8-flash-image"), M("text-embedding-004"),
                         M("gemini-3.8-flash-tts"), M("gemini-x", acts=("embedContent",))]
     found = ai.discover_models(C())
-    assert found[:3] == ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite"]  # stable flash ก่อน
+    assert found[:3] == ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"]  # v6.7: flash-lite ก่อน (ประหยัดโควต้าฟรี)
     assert found.index("gemini-3.8-pro") < found.index("gemini-3.9-flash-preview")  # preview ท้ายสุด
     assert not any(x in " ".join(found) for x in ("image", "embedding", "tts", "gemini-x"))
     ai._DISCOVERED[:] = found
     ch = ai.model_chain(ai.AUTO_MODEL)
-    assert ch[0] == found[0] and "gemini-flash-latest" in ch and ai.AUTO_MODEL not in ch
+    assert ch[0] == found[0] and ch[-1] == "gemini-flash-lite-latest" and ai.AUTO_MODEL not in ch  # alias lite ปิดท้าย
     assert ai.model_chain("gemini-pro-latest")[0] == "gemini-pro-latest"
     ai._DISCOVERED.clear()
 

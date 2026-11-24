@@ -1347,8 +1347,10 @@ def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> 
         raise RuntimeError("ดึงข้อมูล BTC ไม่ได้ — ระงับการวิเคราะห์ (ข้อมูลไม่เพียงพอ)")
 
     progress("🏛 Fundamental + Macro Agent…")
-    ext = f_ext.result()
-    cg, glob, llama, rss, det = ext["cg"], ext["glob"], ext["llama"], ext["rss"], ext["det"]
+    # ข้อมูลเสริม (CoinGecko/DefiLlama/RSS) พัง → ใช้ค่าว่างแทน ไม่ให้ล้มทั้งรอบ (ราคาจาก Binance ยังครบ)
+    ext = _safe(f_ext, {}, "ข้อมูลพื้นฐาน (CoinGecko/DefiLlama/RSS)", bg_errors)
+    cg, glob, rss, det = ext.get("cg") or {}, ext.get("glob") or {}, ext.get("rss") or [], ext.get("det") or {}
+    llama = ext.get("llama") or {"protocols": [], "chains": [], "fees": []}
     fng = _safe(f_fng, None, "Fear & Greed", bg_errors)
     btc_d = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1d"]))
     btc_w = closed_only(add_indicators(frames[f"BTC{QUOTE}"]["1w"]))
@@ -1360,7 +1362,12 @@ def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> 
     coins, skipped = [], []
     for s in syms:
         t = s[: -len(QUOTE)]
-        fund = fundamentals_for(t, cg.get(t), det.get((cg.get(t) or {}).get("id")), llama)
+        try:  # ข้อมูลพื้นฐานของเหรียญเดียวพัง → วิเคราะห์ต่อด้วยข้อมูลราคาอย่างเดียว
+            fund = fundamentals_for(t, cg.get(t), det.get((cg.get(t) or {}).get("id")), llama)
+        except Exception as e:  # noqa: BLE001
+            log.exception("fundamentals %s", t)
+            bg_errors.append(f"ข้อมูลพื้นฐาน {t}: {str(e)[:160]}")
+            fund = {}
         try:
             c = analyze_coin(s, frames.get(s, {}), btc_d, macro, fund)
         except Exception as e:  # noqa: BLE001 — เหรียญเดียวพังไม่ล้มทั้งระบบ

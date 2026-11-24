@@ -1,0 +1,16 @@
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
+
+# graphify
+graphify-out/
