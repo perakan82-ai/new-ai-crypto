@@ -869,3 +869,126 @@ def test_result_cache_reuse(app_mod):
     assert app.cached_result(key) == {"ts": 1} and app.latest_result() == {"ts": 1}
     store["results"][key] = (app.time.time() - app.RESULT_TTL_S - 1, {"ts": 1})
     assert app.cached_result(key) is None and app.latest_result() is None
+
+
+# ═══════════════════════ 🔔 cycle_alert (แจ้งเตือนซื้อ/ขาย) ═══════════════════════
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+
+
+def test_alert_usdt_vote_fallback_then_percentile():
+    import cycle_alert as ca
+    assert ca.usdt_vote(8.5, [])["vote"] == "buy"          # เกณฑ์ชั่วคราว ≥ 8%
+    assert ca.usdt_vote(5.5, [])["vote"] == "sell"
+    assert ca.usdt_vote(None, [])["ok"] is False
+    hist = [[f"d{i:03d}", 5 + i * 0.01] for i in range(100)]  # 5.00–5.99 · ครบ 100 วัน → ใช้ percentile
+    assert ca.usdt_vote(5.95, hist)["vote"] == "buy"        # ใกล้จุดสูงสุดของช่วง (ไม่ใช่ ≥8% แล้ว)
+    assert ca.usdt_vote(5.05, hist)["vote"] == "sell"
+
+
+def test_alert_oi_vote_streak_and_flush():
+    import cycle_alert as ca
+    streak = [[f"d{i}", 1.2] for i in range(7)]
+    assert ca.oi_vote(1.2, streak)["vote"] == "sell"
+    assert ca.oi_vote(1.2, streak[:3])["vote"] is None       # alt > BTC แค่ 3 วัน ยังไม่นับ
+    flush = [["d1", 0.9], ["d2", 1.0], ["d3", 0.95], ["d4", 0.7]]
+    assert ca.oi_vote(0.7, flush)["vote"] == "buy"           # ลด 30% จากจุดสูงสุด 3 วัน
+    assert ca.oi_vote(None, [])["ok"] is False
+
+
+def test_alert_market_state_rules():
+    import cycle_alert as ca
+    v = lambda x: {"vote": x, "ok": True, "text": ""}  # noqa: E731
+    miss = {"vote": None, "ok": False, "text": ""}
+    assert ca.market_state([v("buy"), v("buy"), v(None), miss])[0] == "🟢"
+    assert ca.market_state([v("buy"), v("buy"), v("sell"), v(None)])[0] == "🟡"  # ขัดกัน
+    assert ca.market_state([v("buy"), v("buy"), v("buy"), v("sell")])[0] == "🟢"
+    assert ca.market_state([v("sell"), v("sell"), miss, miss])[0] == "🔴"
+    assert ca.market_state([miss] * 4)[3] == 0
+
+
+def test_alert_coin_events_once_per_plan():
+    from datetime import datetime
+    import cycle_alert as ca
+    now = datetime(2026, 11, 23, 12, tzinfo=ca.TH_TZ)
+    plans = {"SOL": {"date": "2026-11-22", "med": {"status": "🟡", "zone": [130, 135], "sl": 120, "tp1": 150, "tp2": 170},
+                     "long": {"status": "🟢", "tiers": [125, 110, 95], "stop": 80}},
+             "OLD": {"date": "2026-10-01", "med": {"status": "🟢", "zone": [1, 2], "sl": 0.5, "tp1": 3, "tp2": 4}}}
+    ev = ca.coin_events(plans, {"SOL": 133, "OLD": 1.5}, {}, now)
+    keys = [k for k, _ in ev]
+    assert keys == ["SOL:2026-11-22:zone"]                   # แผนเก่าเกิน 7 วันไม่แจ้ง
+    assert ca.coin_events(plans, {"SOL": 133}, {k: "x" for k in keys}, now) == []  # ส่งแล้วไม่ส่งซ้ำ
+    names = {k.split(":")[-1] for k, _ in ca.coin_events(plans, {"SOL": 118}, {}, now)}
+    assert {"sl", "dca1"} <= names and "zone" not in names    # หลุด SL ไม่ใช่ "เข้าโซนซื้อ"
+    names = {k.split(":")[-1] for k, _ in ca.coin_events(plans, {"SOL": 171}, {}, now)}
+    assert {"tp1", "tp2"} <= names
+
+
+def test_alert_upsert_daily_keeps_one_per_day():
+    import cycle_alert as ca
+    h = ca.upsert_daily([], "2026-11-22", 8.1)
+    h = ca.upsert_daily(h, "2026-11-23", 8.2)
+    h = ca.upsert_daily(h, "2026-11-23", 8.3, keep=2)
+    assert h == [["2026-11-22", 8.1], ["2026-11-23", 8.3]]
+
+
+def test_daily_scan_save_plans(tmp_path):
+    import daily_scan as ds
+    res = {"coins": [{"ticker": "SOL", "price": 133.0,
+                      "med": {"status": "🟡", "zone": (130.0, 135.0), "sl": 120.0, "tp1": 150.0, "tp2": 170.0},
+                      "long": {"status": "🟢", "tiers": (125.0, 110.0, 95.0), "stop": 80.0}},
+                     {"ticker": "DOGE", "price": 0.2, "med": {}, "long": {}}],
+           "port": {"picks": []}}
+    p = tmp_path / "plans.json"
+    out = ds.save_plans(res, ["SOL"], str(p))
+    assert set(out) == {"SOL"} and out["SOL"]["med"]["zone"] == [130.0, 135.0]
+    import cycle_alert as ca
+    assert ca.load_json(p, {})["SOL"]["long"]["tiers"] == [125.0, 110.0, 95.0]
+
+
+def test_alert_buy_verdict_follows_market_state():
+    from datetime import datetime
+    import cycle_alert as ca
+    now = datetime(2026, 11, 23, 12, tzinfo=ca.TH_TZ)
+    plans = {"SOL": {"date": "2026-11-22", "med": {"status": "🟡", "zone": [130, 135], "sl": 120, "tp1": 150, "tp2": 170}}}
+    txt = {st: ca.coin_events(plans, {"SOL": 133}, {}, now, st)[0][1] for st in ("🟢", "🟡", "🔴")}
+    assert "ซื้อได้เลย" in txt["🟢"] and "ไม้เล็ก" in txt["🟡"] and "ยังไม่ควรซื้อ" in txt["🔴"]
+    votes = [ca.usdt_vote(8.4, []), ca.oi_vote(1.2, [[str(i), 1.2] for i in range(8)]),
+             ca.fng_vote({"value": 12, "label": "Extreme Fear"}), ca.regime_vote(None)]
+    st, b, s, n = ca.market_state(votes)
+    msg = ca.build_message(st, None, b, s, n, votes, [], now)
+    assert st == "🟡" and "ทำไมสัญญาณขัดกัน" in msg and "ยังไม่ไล่ซื้อ Altcoin" in msg and "ไม่มีข้อมูล" in msg
+
+
+def test_alert_picks_rank_and_block():
+    import cycle_alert as ca
+    def row(t, passed, conf, score, price=10.0):
+        return {"ticker": t, "price": price, "passed": passed, "confidence": conf, "score": score, "win_prob": 62.0,
+                "fails": [] if passed else ["Regime ขาลง"], "tags": ["Breakout 20 แท่ง"], "watch": t == "SOL",
+                "plan": {"med": {"status": "🟢", "zone": [9.5, 10.2], "sl": 9.0, "tp1": 12.0, "tp2": 14.0}}}
+    rows = [row("A", False, 0, 90), row("B", True, 55, 10), row("C", True, 70, 5), row("D", False, 0, 40),
+            row("E", False, 0, 60), row("SOL", False, 0, 20)]
+    top = ca.rank_picks(rows)
+    assert [r["ticker"] for r in top] == ["C", "B", "A", "E", "D"]   # ผ่านเกณฑ์ขึ้นก่อน · สูงสุด 5 ตัว
+    mine, market = ca.split_picks(rows, ["SOL"])
+    assert [r["ticker"] for r in mine] == ["SOL"] and "SOL" not in [r["ticker"] for r in market]
+    txt = "\n".join(ca.picks_block(top, "🟡"))
+    assert "ผ่านเกณฑ์ 2/5" in txt and "ซื้อได้แค่ไม้เล็ก" in txt and "รอ ⏳" in txt and "อยู่ในโซน" in txt
+    assert "ยังไม่มีตัวไหนผ่านเกณฑ์" in "\n".join(ca.picks_block([row("A", False, 0, 1)], "🟢"))
+
+
+def test_alert_market_picks_filter_non_crypto_and_weak_trend():
+    import cycle_alert as ca
+    base = {"price": 1.0, "confidence": 0, "score": 50, "win_prob": None, "fails": [], "tags": [], "watch": False,
+            "plan": {"med": {"status": "🟡", "zone": [0.9, 1.0], "sl": 0.8, "tp1": 1.2, "tp2": 1.4}}}
+    rows = [dict(base, ticker="SPCXB", passed=False, trend=0.8, regime="UP"),   # โทเคนหุ้น → ตัด
+            dict(base, ticker="SUI", passed=False, trend=0.2, regime="TRANS"),  # เทรนด์อ่อน → ตัด
+            dict(base, ticker="AAA", passed=False, trend=0.8, regime="DOWN"),   # ขาลง → ตัด
+            dict(base, ticker="ZEC", passed=False, trend=0.6, regime="UP"),     # ผ่าน
+            dict(base, ticker="SOL", passed=True, trend=0.0, regime="TRANS", watch=True)]
+    mine, market = ca.split_picks(rows, ["SOL"], {"SUI", "AAA", "ZEC", "SOL"})
+    assert [r["ticker"] for r in market] == ["ZEC"] and [r["ticker"] for r in mine] == ["SOL"]
+    assert [r["ticker"] for r in ca.split_picks(rows, ["SOL"], None)[1]] == ["SPCXB", "ZEC"]  # ดึง CoinGecko ไม่ได้ → ไม่กรองหุ้น
+    from datetime import datetime
+    msg = ca.build_message("🟡", None, 0, 0, 1, [ca.fng_vote({"value": 50, "label": "Neutral"})], [],
+                           datetime(2026, 11, 24, tzinfo=ca.TH_TZ), [], mine)
+    assert "ไม่มีเหรียญที่แนวโน้มดีพอ" in msg

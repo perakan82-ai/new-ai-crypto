@@ -116,3 +116,13 @@ v5.4 — เจาะลึกละเอียดขึ้น
 pip install -r requirements.txt pytest
 pytest -q test_all.py
 streamlit run app.py
+
+## 🔔 แจ้งเตือนซื้อ/ขายอัตโนมัติ (ทุก 4 ชม.)
+
+`scripts/cycle_alert.py` + `.github/workflows/cycle-alert.yml` เช็กแล้วส่ง Telegram **เฉพาะเมื่อมีเรื่องใหม่**
+
+- **ตลาดรวม 🟢/🟡/🔴** จาก USDT dominance · Alt OI เทียบ BTC OI · Fear & Greed · BTC regime → ส่งเมื่อสถานะเปลี่ยน
+- **รายเหรียญ** จากแผนล่าสุดของสแกนประจำวัน (`data/plans.json`): เข้าโซนซื้อ · แตะ TP1/TP2 · หลุด SL · ถึงไม้ DCA → ส่งครั้งเดียวต่อแผน
+- Secrets เพิ่มเติม (ไม่บังคับ): `COINALYZE_API_KEY` (ข้อมูล Alt OI ฟรี สมัครที่ coinalyze.net) · `COINGECKO_DEMO_KEY`
+- ทดสอบ: Actions → Crypto Buy/Sell Alert → Run workflow (ติ๊ก force = ส่งสรุปทันที)
+- USDT.D ใช้เกณฑ์ชั่วคราว ≥8% / ≤6% จนกว่าระบบเก็บประวัติครบ 90 วัน จากนั้นใช้ percentile ของประวัติจริง
