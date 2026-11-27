@@ -671,8 +671,10 @@ upcoming_news_net = ผลรวมข่าว/อีเวนต์ข้า�
     so, _, mode_s, err_s = gemini_json(client, model, sp, StrategistOut, search=False)
     if not so:
         picks = fallback_strategy(coins, n_med, n_long)
-        return {"picks": picks, "cash": 100 - sum(p["alloc_final"] for p in picks), "strategist": None,
-                "views": {}, "risk": None, "errors": err_s, "mode": "fallback (rule-based)"}
+        # AI ล่ม (quota/schema/network) ก็ยังต้องผ่าน Risk Manager แบบกติกา ไม่ใช่ปล่อยพอร์ตดิบๆ ไม่ผ่านการกรอง corr/beta/OOS
+        picks, ro = risk_rules(picks, coins_by, corr, macro)
+        return {"picks": picks, "cash": max(0.0, 100 - sum(p["alloc_final"] for p in picks)), "strategist": None,
+                "views": {}, "risk": ro, "errors": err_s, "mode": "fallback (rule-based) / risk: rule-based"}
     picks = enforce_strategy(so, coins_by, n_med, n_long)
     views = {v.ticker.upper().replace(QUOTE, ""): v.model_dump() for v in so.coin_views}
 

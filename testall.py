@@ -208,10 +208,30 @@ def test_pipeline_end_to_end(fake_md):
     res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL", "XYZ"], n_extra=0, use_news=False, max_watch=3))
     assert {c["ticker"] for c in res["coins"]} == {"ETH", "SOL"}
     assert res["missing"] == ["XYZ"]
-    assert res["port"]["mode"].startswith("rule-based")
+    assert res["port"]["mode"].startswith("rule-based") and "risk: rule-based" in res["port"]["mode"]
+    assert res["port"]["risk"] is not None  # ไม่มี AI ก็ต้องผ่าน Risk Manager แบบกติกาเหมือนเส้นทาง AI
     assert 0 <= res["port"]["cash"] <= 100
     for s in res["signals"]:
         assert s.sl < s.entry_hi < s.tp1
+
+
+def test_pipeline_fallback_portfolio_applies_risk_rules(monkeypatch, fake_md):
+    """ไม่มี AI (client=None) → fallback_strategy จัดพอร์ตแบบกติกา แต่ก็ต้องถูกตัด allocation ด้วย risk_rules
+    เหมือนเส้นทาง AI เป๊ะ ๆ (correlation สูง/beta สูง/OOS ติดลบ/Macro Bear) ไม่ใช่ปล่อยผ่านดิบ ๆ"""
+    import ai
+    from pipeline import RunConfig, run_pipeline
+    calls = []
+    real_risk_rules = ai.risk_rules
+
+    def spy(picks, coins_by, corr, macro):
+        calls.append(len(picks))
+        return real_risk_rules(picks, coins_by, corr, macro)
+    monkeypatch.setattr(ai, "risk_rules", spy)
+    import pipeline as pl
+    monkeypatch.setattr(pl, "risk_rules", spy)
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False))
+    assert calls and calls[0] == len(res["port"]["picks"])  # risk_rules ถูกเรียกจริงด้วยพอร์ตจาก fallback_strategy
+    assert res["port"]["risk"].verdict in ("APPROVE", "CAUTION")
 
 
 def test_report_renders(fake_md):

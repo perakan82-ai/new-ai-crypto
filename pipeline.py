@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from typing import Callable
 from typing import Literal
 from ai import (_r, enforce_buy_score, fallback_strategy, gemini_json, llm_fn, macro_calendar_agent, research_agent,
-                strategist_and_risk)
+                risk_rules, strategist_and_risk)
 from config import (FEE, MAX_RESEARCH, MAX_SPREAD, MAX_WATCH, QUOTE, REG_TH, SCAN_DEFAULT_EXTRA, SCAN_TOP, SIGNAL_EXPIRY_H, STABLES,
                     STATUS_TXT, TZ_TH, __version__, dist, fbig, fp, fpct, fprob)
 from analysis import _fc_samples, regime_arr, technical_votes
@@ -1482,8 +1482,11 @@ def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> 
                                    cfg.n_med, cfg.n_long, None, cfg.horizon, scan.get("xs_bt"))
     else:
         picks = fallback_strategy(analyzed, cfg.n_med, cfg.n_long)
-        port = {"picks": picks, "cash": 100 - sum(p["alloc_final"] for p in picks), "strategist": None, "views": {},
-                "risk": None, "errors": [], "mode": "rule-based (ไม่มี API key)"}
+        # ไม่มี AI มาคัดพอร์ตก็ยังต้องผ่าน Risk Manager แบบกติกาเดียวกับเส้นทาง AI — กันเหรียญ correlation สูง/beta
+        # สูง/backtest ช่วงล่าสุดติดลบตีคู่กันในพอร์ต ไม่ใช่แค่กรองสถานะจุดเข้าเฉยๆ
+        picks, ro = risk_rules(picks, {c["ticker"]: c for c in analyzed}, corr, macro)
+        port = {"picks": picks, "cash": max(0.0, 100 - sum(p["alloc_final"] for p in picks)), "strategist": None,
+                "views": {}, "risk": ro, "errors": [], "mode": "rule-based (ไม่มี API key) / risk: rule-based"}
     if ddata is not None:
         report, ferrs = _safe(f_focus, (None, []), "AI เจาะลึก", bg_errors)
         deep = deep_pack(fc_, ddata, report, (project or {}).get("errors", []) + ferrs, project, proj_rows)
