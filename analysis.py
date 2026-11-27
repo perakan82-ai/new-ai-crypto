@@ -115,9 +115,12 @@ def sr_levels(d1: pd.DataFrame, w1: pd.DataFrame | None, vp: dict, price: float,
 
 
 def fib_levels(d1: pd.DataFrame) -> dict:
+    """Retracement 52W มาตรฐาน + สองระดับลึก (0.886/0.942) ที่คริปโตมักย่อถึงเวลาตลาดเกิด leverage เกินตัว
+    (เทียบเท่า 88.7%/94.2% ที่สายเทรดสาย Elliott Wave อ้างถึง — ใช้เป็น "กล่องโซนลึก" เพิ่มเติม ไม่ใช่เป้าหมายตายตัว)
+    """
     x = d1.iloc[-365:]
     hi, lo = float(x["high"].max()), float(x["low"].min())
-    r = {f: hi - f * (hi - lo) for f in (0.382, 0.5, 0.618, 0.786)}
+    r = {f: hi - f * (hi - lo) for f in (0.382, 0.5, 0.618, 0.786, 0.886, 0.942)}
     return {"hi52": hi, "lo52": lo, "ret": r, "ext1618": lo + 1.618 * (hi - lo)}
 
 

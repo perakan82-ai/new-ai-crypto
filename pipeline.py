@@ -435,7 +435,7 @@ R:R **1:{m['rr1']:.1f} / 1:{m['rr2']:.1f}** · Win rate **{win_m:.0f}%** (คุ
 - **โครงสร้าง:** 1D {c['struct_d']['label']} {c['struct_d']['bos']} · 1W {c['struct_w']['label']} · EMA9/21/50/200 = {fp(d.ema9)} / {fp(d.ema21)} / {fp(d.ema50)} / {fp(d.ema200)} · RSI {d.rsi:.0f} · ADX {d.adx:.0f} · แท่งล่าสุด: {c['pattern']} · 4H trigger {'✅' if m['trig4h'] else '—'}
 - **Bollinger/VWAP:** BB {fp(d.bb_lo)}–{fp(d.bb_up)} (กว้าง {d.bb_width * 100:.1f}%) · VWAP20 {fp(d.vwap20)}
 - **Volume Profile 180D:** POC {fp(c['vp']['poc'])} · Value Area {fp(c['vp']['val'])}–{fp(c['vp']['vah'])} · Vol ratio {d.vol_ratio:.2f}x · OBV 20D {obv}
-- **Fib 52W:** 0.382 {fp(c['fib']['ret'][0.382])} · 0.618 {fp(c['fib']['ret'][0.618])} · 0.786 {fp(c['fib']['ret'][0.786])} · High {fp(c['fib']['hi52'])}
+- **Fib 52W:** 0.382 {fp(c['fib']['ret'][0.382])} · 0.618 {fp(c['fib']['ret'][0.618])} · 0.786 {fp(c['fib']['ret'][0.786])} · 0.886 {fp(c['fib']['ret'][0.886])} · 0.942 {fp(c['fib']['ret'][0.942])} (โซนลึก) · High {fp(c['fib']['hi52'])}
 - **Risk:** Vol {r['vol_ann'] * 100:.0f}%/ปี (cap {cap_for(c):.0f}%) · MDD 1Y {r['mdd_1y'] * 100:.0f}% · Beta {r['beta']:.2f} · RS90 vs BTC {fpct(r['rs90'])}
 - **พื้นฐาน:** Rank #{f.get('rank', '-')} · MCap {fbig(f.get('mcap'))} · FDV/MCap {fdvm} · ห่าง ATH {fpct(f.get('ath_dist'), 0)} · TVL {fbig(f.get('tvl'))} · Fees 30D {fbig(f.get('fees30d'))} · P/F {pf}
 {proj}
