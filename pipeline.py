@@ -28,7 +28,7 @@ def _ai_models() -> list[str]:
 from deep import deep_analysis, deep_brief, horizon_outlook, peers_for, score_check
 from analysis import (BIAS_TH, analyze_coin, cap_for, chart_patterns, corr_matrix, first_touch, macro_agent,
                       momentum_profile, touch_prob, xs_momentum_backtest, xs_rank)
-from sources import cg_global, external_bundle, fear_greed, fundamentals_for, rss_for
+from sources import cg_global, external_bundle, fear_greed, funding_oi, fundamentals_for, rss_for
 from market import MarketData, add_indicators, closed_only, fetch_frames
 from signals import build_signal
 
@@ -371,17 +371,23 @@ def deep_dive_md(c: dict, research: dict, views: dict, pick_by: dict, capital: f
     oos = f" · Out-of-sample {bt['oos_n']} ไม้ {bt['oos_expectancy']:+.2f}R" if bt["oos_n"] else ""
     obv = "↑ สะสม" if c["d1"]["obv"].iloc[-1] > c["d1"]["obv"].iloc[-21] else "↓ แจกจ่าย"
     fdvm = f"{f['fdv_mcap']:.2f}" if f.get("fdv_mcap") else "-"
+    dv = c.get("deriv") or {}
+    deriv_line = (f"Funding {dv['funding_rate'] * 100:+.4f}%/8ชม. (~{dv['funding_apr'] * 100:+.0f}%/ปี) · "
+                 f"Open Interest {dv['open_interest']:,.0f} สัญญา" if dv.get("funding_rate") is not None else
+                 "ไม่มีสัญญา Futures ให้ตรวจสอบสำหรับเหรียญนี้")
     proj = f"- **โปรเจกต์:** {rd.get('project', '')} · Tokenomics: {rd.get('tokenomics', '-')}" if rd else ""
     bb = f"- 🐂 {rd.get('bull_case', '-')} · 🐻 {rd.get('bear_case', '-')} · Catalyst {rd.get('catalyst_score')}" if rd else ""
     tech = c.get("tech") or {"votes": [], "score": 50, "bull": 0, "bear": 0}
     tech_rows = "\n".join(f"| {t['name']} | {'🟢 บวก' if t['vote'] > 0 else '🔴 ลบ' if t['vote'] < 0 else '⚪ กลาง'} | {t['detail']} |"
                           for t in tech["votes"])
-    ai_s = f"**{c['buy_final']:.0f}/100**" if c.get("buy_ai") is not None else "— (ไม่มี AI)"
-    score_sec = (f"คะแนนควรซื้อ AI {ai_s} · ระบบ **{c.get('buy_sys', 0):.0f}/100** · มุมมอง **{outlook_label(c) if 'buy_sys' in c else '-'}** · "
-                 f"โอกาสขึ้น (สถิติ) **{fprob(c.get('p_up_h'))}** · เทคนิคเห็นตรงกัน {tech['score']:.0f}/100 "
-                 f"(บวก {tech['bull']} · ลบ {tech['bear']}) · ข่าวข้างหน้า {c.get('event_net', 0):+.2f}")
+    ai_s = f"{c['buy_final']:.0f}/100" if c.get("buy_ai") is not None else "— (ไม่มี AI)"
+    # breakdown ของคะแนนรวม — ย้ายมาไว้ใน <details> เพื่อไม่ให้ตัวเลข 0-100 หลายตัวปนกับ "คะแนนคุณภาพ" ตัวหลักด้านบน
+    score_breakdown = (f"- **ส่วนประกอบของคะแนนคุณภาพ:** AI ประเมิน {ai_s} · โมเดลระบบ {c.get('buy_sys', 0):.0f}/100 "
+                       f"({outlook_label(c) if 'buy_sys' in c else '-'}) · เทคนิคเห็นตรงกัน {tech['score']:.0f}/100 "
+                       f"(บวก {tech['bull']} · ลบ {tech['bear']}) · โอกาสขึ้น (สถิติ) {fprob(c.get('p_up_h'))} · "
+                       f"ข่าวข้างหน้า {c.get('event_net', 0):+.2f}")
     return f"""### 🪙 {f.get('name') or c['ticker']} ({c['ticker']}) · {fp(c['price'])}
-**⏱ ระยะกลาง:** {m['status']} {STATUS_TXT[m['status']]} · **🏦 ระยะยาว:** {l['status']} {STATUS_TXT[l['status']]} · **Regime:** {REG_TH[cf['regime']]} · **Score:** {c['score']:.0f}/100
+**⏱ ระยะกลาง:** {m['status']} {STATUS_TXT[m['status']]} · **🏦 ระยะยาว:** {l['status']} {STATUS_TXT[l['status']]} · **Regime:** {REG_TH[cf['regime']]} · **คะแนนคุณภาพ: {c['score']:.0f}/100** (ยิ่งสูงยิ่งน่าเชื่อถือ — ดู "โอกาส" ในตารางแผนด้านล่างสำหรับตัวเลขที่ใช้ตัดสินใจจริง)
 
 > 🧠 **สรุป:** {v.get('verdict') or rule_verdict(c)}
 
@@ -391,14 +397,10 @@ def deep_dive_md(c: dict, research: dict, views: dict, pick_by: dict, capital: f
 **❌ มุมมองผิดเมื่อ:** {invalid}
 {watch}
 
-#### 🧮 คะแนน & เทคนิคที่ใช้ตัดสิน
-{score_sec}
-
+#### 🔧 เทคนิคที่ใช้ตัดสิน
 | เทคนิค | ผล | รายละเอียด |
 |---|---|---|
 {tech_rows}
-
-*คะแนนควรซื้อ ≠ โอกาสชนะ · โอกาสขึ้นมาจากสถิติย้อนหลังของเหรียญนี้ในสภาพตลาดคล้ายกัน ไม่รับประกันอนาคต*
 
 #### 🎯 แผนระยะกลาง (Swing {m['hold']})
 | จุด | ราคา | ห่างจากตอนนี้ | โอกาส / เวลา | ทำอะไร |
@@ -432,11 +434,13 @@ R:R **1:{m['rr1']:.1f} / 1:{m['rr2']:.1f}** · Win rate **{win_m:.0f}%** (คุ
 
 <details><summary>🔬 รายละเอียดเทคนิค / พื้นฐาน / ข่าว</summary>
 
+{score_breakdown}
 - **โครงสร้าง:** 1D {c['struct_d']['label']} {c['struct_d']['bos']} · 1W {c['struct_w']['label']} · EMA9/21/50/200 = {fp(d.ema9)} / {fp(d.ema21)} / {fp(d.ema50)} / {fp(d.ema200)} · RSI {d.rsi:.0f} · ADX {d.adx:.0f} · แท่งล่าสุด: {c['pattern']} · 4H trigger {'✅' if m['trig4h'] else '—'}
 - **Bollinger/VWAP:** BB {fp(d.bb_lo)}–{fp(d.bb_up)} (กว้าง {d.bb_width * 100:.1f}%) · VWAP20 {fp(d.vwap20)}
 - **Volume Profile 180D:** POC {fp(c['vp']['poc'])} · Value Area {fp(c['vp']['val'])}–{fp(c['vp']['vah'])} · Vol ratio {d.vol_ratio:.2f}x · OBV 20D {obv}
 - **Fib 52W:** 0.382 {fp(c['fib']['ret'][0.382])} · 0.618 {fp(c['fib']['ret'][0.618])} · 0.786 {fp(c['fib']['ret'][0.786])} · High {fp(c['fib']['hi52'])}
 - **Risk:** Vol {r['vol_ann'] * 100:.0f}%/ปี (cap {cap_for(c):.0f}%) · MDD 1Y {r['mdd_1y'] * 100:.0f}% · Beta {r['beta']:.2f} · RS90 vs BTC {fpct(r['rs90'])}
+- **Futures (Leverage):** {deriv_line}
 - **พื้นฐาน:** Rank #{f.get('rank', '-')} · MCap {fbig(f.get('mcap'))} · FDV/MCap {fdvm} · ห่าง ATH {fpct(f.get('ath_dist'), 0)} · TVL {fbig(f.get('tvl'))} · Fees 30D {fbig(f.get('fees30d'))} · P/F {pf}
 {proj}
 {bb}
@@ -1368,8 +1372,12 @@ def _run_pipeline(md, cfg, progress, bar, pool, lap, timings, bg_errors, t0) -> 
             log.exception("fundamentals %s", t)
             bg_errors.append(f"ข้อมูลพื้นฐาน {t}: {str(e)[:160]}")
             fund = {}
+        try:  # เหรียญเล็กจำนวนมากไม่มีสัญญา Futures เลย — ไม่มีข้อมูลนี้ก็วิเคราะห์ต่อได้ปกติ
+            deriv = funding_oi(t)
+        except Exception:  # noqa: BLE001
+            deriv = None
         try:
-            c = analyze_coin(s, frames.get(s, {}), btc_d, macro, fund)
+            c = analyze_coin(s, frames.get(s, {}), btc_d, macro, fund, deriv)
         except Exception as e:  # noqa: BLE001 — เหรียญเดียวพังไม่ล้มทั้งระบบ
             log.exception("analyze %s", s)
             skipped.append(f"{t}: {e}")
@@ -1525,7 +1533,11 @@ def run_portfolio(md: MarketData, holds_in: list[dict], res: dict | None, client
             cg = ext["cg"].get(t)
             fund = fundamentals_for(t, cg, ext["det"].get((cg or {}).get("id")), ext["llama"])
             try:
-                cc = analyze_coin(f"{t}{QUOTE}", fr.get(f"{t}{QUOTE}", {}), btc_d, macro, fund)
+                deriv = funding_oi(t)
+            except Exception:  # noqa: BLE001
+                deriv = None
+            try:
+                cc = analyze_coin(f"{t}{QUOTE}", fr.get(f"{t}{QUOTE}", {}), btc_d, macro, fund, deriv)
             except Exception as e:  # noqa: BLE001
                 cc = None
                 errors.append(f"{t}: {e}")

@@ -52,7 +52,15 @@ def risk_factors(c: dict, macro: dict, news: dict | None) -> list[str]:
     if bt["oos_n"] >= 3 and bt["oos_expectancy"] < 0:
         out.append("ผล Backtest ช่วงหลัง (out-of-sample) ติดลบ")
     if m["ft1"] and m["ft1"]["n_eff"] < 15:
-        out.append(f"ตัวอย่างสถิติน้อย (n={m['ft1']['n_eff']})")
+        out.append(f"ข้อมูลย้อนหลังยังน้อย (n={m['ft1']['n_eff']}) — ผลสถิติด้านบนอาจยังไม่แม่น")
+    dv = c.get("deriv") or {}
+    if dv.get("funding_apr") is not None:
+        if dv["funding_apr"] > 0.5:  # ฝั่ง Long จ่ายฝั่ง Short มากผิดปกติต่อเนื่อง = Long แน่นเกินไป
+            out.append(f"Futures Funding {dv['funding_apr'] * 100:+.0f}%/ปี — ฝั่ง Long ใช้ Leverage แน่นมาก "
+                       f"เสี่ยงโดนบีบขายทำกำไร (long squeeze) ย่อแรงกว่าปกติถ้าสัญญาณกลับ")
+        elif dv["funding_apr"] < -0.3:  # ฝั่ง Short จ่ายฝั่ง Long = Short แน่นเกินไป มักสวนทางหวือหวาได้
+            out.append(f"Futures Funding {dv['funding_apr'] * 100:+.0f}%/ปี — ฝั่ง Short แน่นมาก "
+                       f"ราคาอาจกระชากขึ้นแรงกว่าปกติ (short squeeze) ถ้ามีข่าวดีมากระทบ")
     if news and news.get("score", 0) < -0.15:
         out.append(f"ข่าวเชิงลบ ({news['score']:+.2f})")
     mo = c.get("mom") or {}

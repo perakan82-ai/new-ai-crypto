@@ -1,0 +1,9 @@
+# ธีมสีของแอป — ให้เข้ากับกราฟ Plotly dark theme ที่ใช้อยู่แล้วใน chart() (app.py)
+# ก่อนหน้านี้ไม่มีไฟล์นี้เลย แอปจึงใช้ธีม Streamlit ดีฟอลต์ (หน้าตาเหมือนแอป Streamlit ทั่วไป)
+[theme]
+base = "dark"
+primaryColor = "#38bdf8"          # ฟ้า — สีเดียวกับเส้น EMA21/forecast ในกราฟ
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1a1f2b"
+textColor = "#e5e7eb"
+font = "sans serif"

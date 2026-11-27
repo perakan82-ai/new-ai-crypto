@@ -17,6 +17,9 @@ from urllib3.util.retry import Retry
 # ───────────── Market data ─────────────
 # data-api.binance.vision มาก่อน: ใช้ได้จาก Server สหรัฐฯ (Streamlit Cloud / GitHub Actions) ที่ api.binance.com บล็อก (HTTP 451)
 BINANCE_HOSTS = ("https://data-api.binance.vision/api/v3", "https://api.binance.com/api/v3")
+# USDT-M Perpetual Futures (แยก host จาก spot) — ใช้ดู funding rate/leverage positioning รายเหรียญ
+# ไม่ใช่ทุกเหรียญจะมีสัญญา futures (โดยเฉพาะ cap เล็ก) — เรียกแล้วไม่เจอให้ถือว่าไม่มีข้อมูล ไม่ใช่ error
+BINANCE_FAPI = "https://fapi.binance.com/fapi/v1"
 QUOTE = "USDT"
 TF_LIMIT = {"1h": 1000, "4h": 500, "1d": 1000, "1w": 1000}
 TF_TTL = {"1h": 300, "4h": 600, "1d": 600, "1w": 1800}  # เก็บแท่งเทียนใช้ซ้ำ (วินาที)

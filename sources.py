@@ -18,7 +18,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pydantic import BaseModel
 from urllib.parse import quote_plus
-from config import CG_BASE, CG_IDS, LLAMA, RSS_FEEDS, SESSION, get_json, ttl_cache
+from config import BINANCE_FAPI, CG_BASE, CG_IDS, LLAMA, RSS_FEEDS, SESSION, get_json, ttl_cache
 
 
 # ════════════════════ fundamentals ════════════════════
@@ -132,6 +132,25 @@ def fear_greed() -> dict | None:
         return {"value": int(d[0]["value"]), "label": d[0]["value_classification"],
                 "d1": int(d[1]["value"]), "d7": int(d[-1]["value"])}
     except Exception:  # noqa: BLE001
+        return None
+
+
+@ttl_cache(900)
+def funding_oi(ticker: str) -> dict | None:
+    """Funding rate + Open Interest ของสัญญา USDT-M Perpetual (ถ้ามี) — ไม่ใช่เรื่องเดียวกับราคา Spot
+
+    Funding บวกสูงต่อเนื่อง = ฝั่ง Long จ่ายให้ฝั่ง Short เยอะ = คนแห่ถือ Long ด้วย Leverage เยอะผิดปกติ
+    (ความเสี่ยง "long squeeze" / ย่อแรงกว่าปกติเวลาสัญญาณกลับ) · ตรงข้ามถ้าติดลบหนัก = Short เบียดกันแน่น
+    เหรียญเล็กจำนวนมากไม่มีสัญญา Futures บน Binance เลย — คืน None เฉยๆ ไม่ใช่ error
+    """
+    symbol = f"{ticker}USDT"
+    try:
+        pr = get_json(f"{BINANCE_FAPI}/premiumIndex", {"symbol": symbol})
+        rate = float(pr["lastFundingRate"])
+        oi = get_json(f"{BINANCE_FAPI}/openInterest", {"symbol": symbol})
+        return {"funding_rate": rate, "funding_apr": rate * 3 * 365,  # Binance เก็บทุก 8 ชม. = 3 ครั้ง/วัน
+                "open_interest": float(oi["openInterest"])}
+    except Exception:  # noqa: BLE001 — ไม่มีสัญญา Futures / เครือข่ายมีปัญหา ไม่ถือเป็นข้อผิดพลาดของการวิเคราะห์หลัก
         return None
 
 
