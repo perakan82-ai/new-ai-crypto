@@ -878,7 +878,7 @@ def main():
         hz = st.selectbox("⏳ อยากถือประมาณ", list(HORIZONS), index=2)
         capital = st.number_input("💰 เงินทุน (USDT)", 100.0, 1e9, 10_000.0, 500.0)
         risk_pct = st.slider("🛡 ยอมเสียต่อไม้ (% ทุน)", 0.25, 3.0, 1.0, 0.25)
-        gkey = _secret("GEMINI_API_KEY") or st.text_input("🔑 Gemini API Key", type="password")
+        gkey = _secret("GEMINI_API_KEY")  # ตั้งไว้ใน Secrets ของแอปแล้ว — ไม่ต้องมีช่องให้กรอกเอง
         run = st.button("🚀 เริ่มวิเคราะห์", type="primary", use_container_width=True)
         fast = st.toggle("⚡ โหมดเร็ว (แนะนำ)", value=True,
                          help="ข่าวใช้การวิเคราะห์แบบคำสำคัญแทน AI · ใช้ผลเดิมถ้าเพิ่งวิเคราะห์ด้วยค่าเดียวกันภายใน 15 นาที")
