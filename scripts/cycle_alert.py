@@ -496,7 +496,7 @@ def main() -> None:
 
     plans = load_json(PLANS_FILE, {})
     sent = state.get("sent", {})
-    events = []
+    events, prices = [], {}
     if plans:
         try:
             tk = md.tickers()
@@ -504,6 +504,23 @@ def main() -> None:
             events = coin_events(plans, prices, sent, now, st)
         except Exception as e:  # noqa: BLE001
             print(f"เช็กราคารายเหรียญไม่สำเร็จ: {e}", file=sys.stderr)
+
+    try:  # ปิดสัญญาณในทะเบียนผลย้อนหลังตามราคาที่เพิ่งเช็กไปแล้วข้างบน — พังก็ไม่ทำให้การแจ้งเตือนหลักล้ม
+        from ledger import load_ledger, resolve, save_ledger
+        ledger = load_ledger()
+        n_closed = 0
+        for key, _ in events:
+            parts = key.split(":")
+            if len(parts) != 3 or parts[2] not in ("sl", "tp1", "tp2"):
+                continue
+            ticker = parts[0]
+            if ticker in prices and resolve(ledger, ticker, parts[2], prices[ticker], day):
+                n_closed += 1
+        if n_closed:
+            save_ledger(ledger)
+            print(f"ทะเบียนสัญญาณ: ปิดผล {n_closed} รายการ")
+    except Exception as e:  # noqa: BLE001
+        print(f"อัปเดต data/signal_log.json ไม่สำเร็จ: {e}", file=sys.stderr)
 
     # เหรียญแนะนำจากตลาด — เหรียญที่ "เพิ่งผ่านเกณฑ์" นับเป็นเรื่องใหม่ที่ต้องแจ้ง (ครั้งเดียวต่อวัน)
     watch = [w.strip().upper() for w in os.environ.get("SCAN_WATCH", "").split(",") if w.strip()]

@@ -28,6 +28,7 @@ import streamlit as st
 import sources as na
 from ai import make_client
 from analysis import cap_for
+from ledger import load_ledger, overall_stats, stats_by_bucket
 from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
                     SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, MAX_RESEARCH, RESULT_TTL_S, __version__, dist, fbig, fp, fpct, fprob)
 from market import MarketData
@@ -255,7 +256,9 @@ def render_picks(res: dict, horizon: int, capital: float, risk_pct: float):
     if len(mp):
         st.caption(f"สแกน {sc.get('universe', 0)} เหรียญ Volume สูง · ตัด spread กว้าง {sc.get('dropped_spread', 0)} เหรียญ · "
                    "จัดอันดับด้วย Momentum ปรับความผันผวนเทียบตลาด + Trend (Donchian 5 lookback) + สัญญาณเทคนิค/รูปแบบกราฟ")
-        st.dataframe(mp, use_container_width=True, hide_index=True)
+        spark_col = [c for c in mp.columns if c.startswith("เทรนด์")]
+        st.dataframe(mp, use_container_width=True, hide_index=True,
+                     column_config={c: st.column_config.LineChartColumn(width="small") for c in spark_col})
         bt = sc.get("xs_bt") or {}
         if bt.get("excess") is not None:
             k = st.columns(4)
@@ -271,7 +274,10 @@ def render_picks(res: dict, horizon: int, capital: float, risk_pct: float):
         st.caption("ปิด Scanner อยู่ (เลื่อน 'ให้ AI คัดเหรียญจากตลาด' ใน Sidebar)")
     st.markdown(f"#### 🔥 เหรียญที่มีโอกาสขึ้นใน {horizon} วัน (เรียงตามคะแนนโอกาส)")
     st.caption("⭐ = Scanner คัดจากตลาด (Volume สูง + สัญญาณเทคนิค/รูปแบบกราฟ) · ไม่มีดาว = Watchlist ของคุณ")
-    st.dataframe(opportunity_rank(coins, horizon, research), use_container_width=True, hide_index=True)
+    orank = opportunity_rank(coins, horizon, research)
+    spark_col2 = [c for c in orank.columns if c.startswith("เทรนด์")]
+    st.dataframe(orank, use_container_width=True, hide_index=True,
+                 column_config={c: st.column_config.LineChartColumn(width="small") for c in spark_col2})
     st.caption("คะแนนโอกาส = โอกาสปิดสูงกว่าวันนี้ 35% + upside เทียบจุดย่อ 20% + สถานะจุดเข้า 15% + รูปแบบกราฟ 10% + "
                "ข่าว/อีเวนต์ 10% + Momentum/Trend 10% · โอกาสมาจากสถิติย้อนหลังของเหรียญนั้น ไม่รับประกันอนาคต")
     st.markdown("#### 🧭 AI คัดเข้าพอร์ต")
@@ -810,7 +816,42 @@ def render_roadmap(res: dict):
                                for c in res["coins"]]), use_container_width=True, hide_index=True)
 
 
+def render_track_record():
+    """เช็กผลย้อนหลังอัตโนมัติ — ไม่ต้องดาวน์โหลด/อัปโหลดเอง: data/signal_log.json ถูกบันทึกและปิดผล
+    อัตโนมัติทุกวันโดย GitHub Actions (daily_scan.py บันทึกสัญญาณใหม่ · cycle_alert.py ปิดผลเมื่อแตะ SL/TP จริง)
+    มีเฉพาะตอนรันผ่าน GitHub Actions แล้วอย่างน้อย 1 รอบ — รันแอปในเครื่องอย่างเดียวจะยังไม่มีไฟล์นี้"""
+    ledger = load_ledger()
+    st.markdown("#### 🧮 เช็กผลย้อนหลังอัตโนมัติ (จากสแกนประจำวันจริง ไม่ใช่ backtest)")
+    if not ledger:
+        st.caption("ยังไม่มีข้อมูล — ทะเบียนนี้เติมเองทุกวันจากการสแกนอัตโนมัติ (GitHub Actions) เมื่อมีสัญญาณผ่านเกณฑ์ครั้งแรก "
+                   "ต้องรอให้สัญญาณแตะ TP หรือ SL จริงก่อนถึงจะเริ่มเห็นอัตราชนะ")
+        return
+    sm = overall_stats(ledger)
+    k = st.columns(4)
+    k[0].metric("สัญญาณทั้งหมด", sm["total"], f"เปิดอยู่ {sm['open']}")
+    k[1].metric("ตัดสินผลแล้ว", sm["decided"])
+    k[2].metric("อัตราชนะจริง", fprob(sm["win_rate"] / 100) if sm["win_rate"] is not None else "-")
+    k[3].metric("R เฉลี่ย", f"{sm['avg_r']:+.2f}R" if sm["avg_r"] is not None else "-")
+    if sm["decided"] < 20:
+        st.caption(f"ตัวอย่างยังน้อย ({sm['decided']} รายการ) — ต้องสะสมอย่างน้อย ~20-30 รายการถึงจะเริ่มเชื่อถือได้")
+    buckets = [b for b in stats_by_bucket(ledger) if b["สัญญาณ"]]
+    if buckets:
+        st.caption("**คะแนนคุณภาพสูง ชนะจริงมากกว่าจริงไหม?** (ถ้าช่วงคะแนนสูงไม่ได้ชนะมากกว่าช่วงต่ำ แปลว่าคะแนนยังแยกของดี/แย่ไม่ออก)")
+        st.dataframe(pd.DataFrame(buckets), use_container_width=True, hide_index=True)
+    with st.expander(f"รายการล่าสุด ({min(len(ledger), 30)}/{len(ledger)})"):
+        recent = sorted(ledger, key=lambda r: r["date"], reverse=True)[:30]
+        st.dataframe(pd.DataFrame([{"วันที่": r["date"], "เหรียญ": r["ticker"], "คะแนนคุณภาพ": r["confidence"],
+                                    "ผล": {"tp1": "✅ TP1", "tp2": "✅ TP2", "sl": "🛑 SL", "expired": "⏳ หมดอายุ",
+                                           None: "🔵 เปิดอยู่"}[r.get("outcome")],
+                                    "ปิดวันที่": r.get("outcome_date") or "-"} for r in recent]),
+                     use_container_width=True, hide_index=True)
+    st.caption("สัญญาณ = จุดเข้าที่ผ่านเกณฑ์คุณภาพทั้งหมด (quality_gate) ของการสแกนประจำวันจริง ไม่ใช่ข้อมูลจำลอง · "
+               "ปิดด้วย TP1/TP2/SL จริงที่ cycle_alert.py ตรวจทุก 4 ชม. · ค้างเกิน 45 วันไม่ถึงเป้าไหนนับว่า 'หมดอายุ' ไม่นับแพ้/ชนะ")
+    st.divider()
+
+
 def render_export(res: dict, horizon: int):
+    render_track_record()
     st.markdown("#### 💾 ดาวน์โหลดผลวิเคราะห์ (เก็บไว้ทำ Backtest / Forward test)")
     ex = analysis_export_df(res, horizon)
     c1, c2 = st.columns(2)

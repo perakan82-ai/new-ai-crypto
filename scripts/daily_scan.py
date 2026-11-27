@@ -176,6 +176,17 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"บันทึก data/plans.json ไม่สำเร็จ: {e}", file=sys.stderr)
 
+    try:  # บันทึกสัญญาณวันนี้เข้าทะเบียนผลย้อนหลัง (เช็กอัตราชนะจริงทีหลังใน app.py) — พังก็ไม่ทำให้สแกนหลักล้ม
+        from ledger import expire_stale, load_ledger, record_signals, save_ledger
+        day = datetime.now(TH_TZ).strftime("%Y-%m-%d")
+        ledger = load_ledger()
+        added = record_signals(ledger, res.get("signals", []), day)
+        expired = expire_stale(ledger, datetime.now(TH_TZ))
+        save_ledger(ledger)
+        print(f"ทะเบียนสัญญาณ: เพิ่มใหม่ {added} · หมดอายุ {expired} · รวม {len(ledger)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"บันทึก data/signal_log.json ไม่สำเร็จ: {e}", file=sys.stderr)
+
     pretty = format_for_telegram(text)
     if not send_telegram(tg_token, tg_chat, pretty, html_mode=True):
         print("ส่งรายงานไม่สำเร็จ", file=sys.stderr)

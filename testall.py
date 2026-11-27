@@ -992,3 +992,88 @@ def test_alert_market_picks_filter_non_crypto_and_weak_trend():
     msg = ca.build_message("🟡", None, 0, 0, 1, [ca.fng_vote({"value": 50, "label": "Neutral"})], [],
                            datetime(2026, 11, 24, tzinfo=ca.TH_TZ), [], mine)
     assert "ไม่มีเหรียญที่แนวโน้มดีพอ" in msg
+
+
+# ═══════════════════════ 🧮 ledger (เช็กผลย้อนหลังของสัญญาณจริง) ═══════════════════════
+def _fake_sig(ticker, confidence, price=100.0, sl=90.0, tp1=120.0, tp2=140.0, win_prob=60.0):
+    import types
+    return types.SimpleNamespace(id=f"{ticker}-x", ticker=ticker, confidence=confidence, win_prob=win_prob,
+                                 price_at_signal=price, entry_lo=price * 0.98, entry_hi=price, sl=sl, tp1=tp1,
+                                 tp2=tp2, rr1=2.0)
+
+
+def test_ledger_record_skips_already_open_ticker():
+    import ledger as lg
+    ledger = []
+    assert lg.record_signals(ledger, [_fake_sig("SOL", 80)], "2026-11-01") == 1
+    assert lg.record_signals(ledger, [_fake_sig("SOL", 85), _fake_sig("ETH", 70)], "2026-11-02") == 1  # SOL ยังเปิดอยู่
+    assert {r["ticker"] for r in ledger} == {"SOL", "ETH"}
+    assert len(ledger) == 2
+
+
+def test_ledger_resolve_closes_latest_open_only():
+    import ledger as lg
+    ledger = []
+    lg.record_signals(ledger, [_fake_sig("SOL", 80)], "2026-11-01")
+    assert lg.resolve(ledger, "SOL", "tp1", 121.0, "2026-11-05") is True
+    assert ledger[0]["outcome"] == "tp1" and ledger[0]["outcome_price"] == 121.0
+    assert lg.resolve(ledger, "SOL", "tp2", 141.0, "2026-11-06") is False  # ปิดไปแล้ว ไม่มีสัญญาณเปิดค้าง
+    assert lg.resolve(ledger, "DOGE", "sl", 1.0, "2026-11-06") is False   # ไม่เคยมีสัญญาณของเหรียญนี้เลย
+    lg.record_signals(ledger, [_fake_sig("SOL", 90)], "2026-11-07")       # ปิดไปแล้ว → เปิดสัญญาณใหม่ได้อีก
+    assert sum(r["outcome"] is None for r in ledger) == 1
+
+
+def test_ledger_expire_stale():
+    import ledger as lg
+    from datetime import datetime
+    ledger = []
+    lg.record_signals(ledger, [_fake_sig("SOL", 80)], "2026-09-01")  # เก่ามาก
+    lg.record_signals(ledger, [_fake_sig("ETH", 80)], "2026-11-20")  # ยังใหม่
+    n = lg.expire_stale(ledger, datetime(2026, 11, 27))
+    assert n == 1
+    assert next(r for r in ledger if r["ticker"] == "SOL")["outcome"] == "expired"
+    assert next(r for r in ledger if r["ticker"] == "ETH")["outcome"] is None
+
+
+def test_ledger_stats_by_bucket_and_overall():
+    import ledger as lg
+    ledger = []
+    lg.record_signals(ledger, [_fake_sig("A", 65)], "2026-10-01")
+    lg.resolve(ledger, "A", "tp1", 120.0, "2026-10-05")              # win, R = +2
+    lg.record_signals(ledger, [_fake_sig("B", 65, price=200.0, sl=180.0)], "2026-10-02")
+    lg.resolve(ledger, "B", "sl", 180.0, "2026-10-06")               # loss, R = -1
+    lg.record_signals(ledger, [_fake_sig("C", 95)], "2026-10-03")
+    lg.resolve(ledger, "C", "expired", None, "2026-11-20")           # ไม่นับแพ้/ชนะ
+    buckets = {b["ช่วงคะแนนคุณภาพ"]: b for b in lg.stats_by_bucket(ledger)}
+    b60 = buckets["60-75"]
+    assert b60["สัญญาณ"] == 2 and b60["ตัดสินผลแล้ว"] == 2 and b60["อัตราชนะจริง"] == 50.0
+    assert b60["R เฉลี่ย"] == pytest.approx(0.5, abs=0.01)           # เฉลี่ยของ +2R กับ -1R
+    b90 = buckets["90+"]
+    assert b90["สัญญาณ"] == 1 and b90["ตัดสินผลแล้ว"] == 0 and b90["หมดอายุ (ไม่นับ)"] == 1
+    sm = lg.overall_stats(ledger)
+    assert sm["total"] == 3 and sm["decided"] == 2 and sm["win_rate"] == 50.0
+
+
+def test_ledger_persists_round_trip(tmp_path):
+    import ledger as lg
+    path = tmp_path / "signal_log.json"
+    ledger = []
+    lg.record_signals(ledger, [_fake_sig("SOL", 80)], "2026-11-01")
+    lg.save_ledger(ledger, path)
+    reloaded = lg.load_ledger(path)
+    assert reloaded == ledger
+    assert lg.load_ledger(tmp_path / "missing.json") == []
+
+
+# ═══════════════════════ 📈 sparkline (เทรนด์ราคาในตารางภาพรวม) ═══════════════════════
+def test_sparkline_column_in_overview_tables(fake_md):
+    from pipeline import RunConfig, SPARK_N, opportunity_rank, run_pipeline, table_market_picks
+    res = run_pipeline(fake_md, RunConfig(watch=["ETH", "SOL"], n_extra=0, use_news=False, max_watch=3))
+    spark_col = f"เทรนด์ {SPARK_N}วัน"
+    orank = opportunity_rank(res["coins"], 30)
+    assert spark_col in orank.columns
+    assert all(isinstance(v, list) and len(v) == SPARK_N and all(isinstance(x, float) for x in v)
+              for v in orank[spark_col])
+    mp = table_market_picks(res["coins"])
+    if len(mp):
+        assert spark_col in mp.columns and len(mp[spark_col].iloc[0]) == SPARK_N
