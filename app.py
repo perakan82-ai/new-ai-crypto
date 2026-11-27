@@ -28,7 +28,7 @@ import streamlit as st
 import sources as na
 from ai import make_client
 from analysis import cap_for
-from ledger import load_ledger, overall_stats, stats_by_bucket
+from ledger import calibration_warnings, load_ledger, overall_stats, stats_by_bucket
 from config import (DEFAULT_WATCH, GEMINI_MODELS, MAJORS, MAX_WATCH, MODEL_FALLBACK, QUOTE, REG_TH,
                     SCAN_DEFAULT_EXTRA, XS_HOLD, XS_TOP, MAX_RESEARCH, RESULT_TTL_S, __version__, dist, fbig, fp, fpct, fprob)
 from market import MarketData
@@ -838,6 +838,8 @@ def render_track_record():
     if buckets:
         st.caption("**คะแนนคุณภาพสูง ชนะจริงมากกว่าจริงไหม?** (ถ้าช่วงคะแนนสูงไม่ได้ชนะมากกว่าช่วงต่ำ แปลว่าคะแนนยังแยกของดี/แย่ไม่ออก)")
         st.dataframe(pd.DataFrame(buckets), use_container_width=True, hide_index=True)
+        for w in calibration_warnings(buckets):
+            st.warning(w)
     with st.expander(f"รายการล่าสุด ({min(len(ledger), 30)}/{len(ledger)})"):
         recent = sorted(ledger, key=lambda r: r["date"], reverse=True)[:30]
         st.dataframe(pd.DataFrame([{"วันที่": r["date"], "เหรียญ": r["ticker"], "คะแนนคุณภาพ": r["confidence"],

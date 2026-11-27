@@ -1048,10 +1048,26 @@ def test_ledger_stats_by_bucket_and_overall():
     b60 = buckets["60-75"]
     assert b60["สัญญาณ"] == 2 and b60["ตัดสินผลแล้ว"] == 2 and b60["อัตราชนะจริง"] == 50.0
     assert b60["R เฉลี่ย"] == pytest.approx(0.5, abs=0.01)           # เฉลี่ยของ +2R กับ -1R
+    assert b60["คาดไว้ตอนออกสัญญาณ"] == 60.0                          # win_prob เฉลี่ยของ A กับ B (ค่าเริ่มต้น _fake_sig)
     b90 = buckets["90+"]
     assert b90["สัญญาณ"] == 1 and b90["ตัดสินผลแล้ว"] == 0 and b90["หมดอายุ (ไม่นับ)"] == 1
     sm = lg.overall_stats(ledger)
     assert sm["total"] == 3 and sm["decided"] == 2 and sm["win_rate"] == 50.0
+
+
+def test_ledger_calibration_warnings_need_enough_samples_and_gap():
+    import ledger as lg
+    # ช่วง 60-75: 20 สัญญาณ ชนะจริงแค่ 5/20 (25%) แต่เคยประเมินไว้ 60% → ห่างกัน 35 จุด + ตัวอย่างพอ → ต้องเตือน
+    low_bucket = {"ช่วงคะแนนคุณภาพ": "60-75", "สัญญาณ": 20, "ตัดสินผลแล้ว": 20,
+                 "คาดไว้ตอนออกสัญญาณ": 60.0, "อัตราชนะจริง": 25.0, "R เฉลี่ย": -0.2}
+    # ช่วง 75-90: ห่างกันเยอะเหมือนกันแต่ตัวอย่างน้อยกว่า MIN_SAMPLE_WARN → ยังไม่ควรเตือน (อาจเป็นความบังเอิญ)
+    few_samples = {"ช่วงคะแนนคุณภาพ": "75-90", "สัญญาณ": 5, "ตัดสินผลแล้ว": 5,
+                   "คาดไว้ตอนออกสัญญาณ": 70.0, "อัตราชนะจริง": 20.0, "R เฉลี่ย": -0.5}
+    # ช่วง 90+: ตัวอย่างพอและชนะจริงใกล้เคียงที่ประเมิน (ห่างกันน้อยกว่าเกณฑ์) → ไม่ควรเตือน
+    fine_bucket = {"ช่วงคะแนนคุณภาพ": "90+", "สัญญาณ": 20, "ตัดสินผลแล้ว": 20,
+                  "คาดไว้ตอนออกสัญญาณ": 70.0, "อัตราชนะจริง": 65.0, "R เฉลี่ย": 0.8}
+    warnings = lg.calibration_warnings([low_bucket, few_samples, fine_bucket])
+    assert len(warnings) == 1 and "60-75" in warnings[0] and "25%" in warnings[0] and "60%" in warnings[0]
 
 
 def test_ledger_persists_round_trip(tmp_path):

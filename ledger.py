@@ -91,17 +91,40 @@ def _r_multiple(r: dict) -> float | None:
 
 
 def stats_by_bucket(ledger: list[dict]) -> list[dict]:
-    """อัตราชนะ (TP ก่อน SL) + R เฉลี่ย แยกตามช่วงคะแนนคุณภาพตอนออกสัญญาณ — นับเฉพาะที่ปิดแล้ว (expired ไม่นับเข้าอัตราชนะ)"""
+    """อัตราชนะ (TP ก่อน SL) + R เฉลี่ย แยกตามช่วงคะแนนคุณภาพตอนออกสัญญาณ — นับเฉพาะที่ปิดแล้ว (expired ไม่นับเข้าอัตราชนะ)
+    รวม \"คาดไว้ตอนออกสัญญาณ\" (win_prob เฉลี่ยที่ระบบประเมินไว้ ไม่ใช่คะแนนคุณภาพ) ไว้เทียบกับอัตราชนะจริง"""
     out = []
     for lo, hi, label in BUCKETS:
         rows = [r for r in ledger if r.get("outcome") is not None and lo <= r["confidence"] < hi]
         decided = [r for r in rows if r["outcome"] != "expired"]
         wins = [r for r in decided if r["outcome"] in OUTCOMES_WIN]
         r_vals = [v for v in (_r_multiple(r) for r in decided) if v is not None]
+        est = [r["win_prob"] for r in decided if r.get("win_prob") is not None]
         out.append({"ช่วงคะแนนคุณภาพ": label, "สัญญาณ": len(rows), "ตัดสินผลแล้ว": len(decided),
                     "หมดอายุ (ไม่นับ)": len(rows) - len(decided),
+                    "คาดไว้ตอนออกสัญญาณ": round(sum(est) / len(est), 0) if est else None,
                     "อัตราชนะจริง": round(len(wins) / len(decided) * 100, 0) if decided else None,
                     "R เฉลี่ย": round(sum(r_vals) / len(r_vals), 2) if r_vals else None})
+    return out
+
+
+MIN_SAMPLE_WARN = 15  # ตัวอย่างขั้นต่ำต่อช่วงคะแนนถึงจะเชื่อส่วนต่างได้ — น้อยกว่านี้อาจเป็นแค่ความบังเอิญ
+EDGE_GAP_PTS = 10      # ชนะจริงต่ำกว่าที่คาดไว้เกินกี่จุด ถึงจะเตือน (เท่ากับเกณฑ์เดียวกับฟีเจอร์ตรวจ CSV เดิม)
+
+
+def calibration_warnings(buckets: list[dict], min_sample: int = MIN_SAMPLE_WARN, gap_pts: float = EDGE_GAP_PTS) -> list[str]:
+    """เตือน (ข้อความ ไม่ใช่การปรับขนาดไม้อัตโนมัติ) เมื่อช่วงคะแนนคุณภาพช่วงใดมีตัวอย่างพอและชนะจริงต่ำกว่าที่
+    ระบบเคยประเมินไว้เกิน gap_pts จุด — เป็นสัญญาณว่าคะแนนช่วงนั้นเริ่มไม่น่าเชื่อถือ ควรพิจารณาลดขนาดไม้เอง
+    (ตั้งใจไม่ทำเป็นการลดขนาดไม้อัตโนมัติ เพราะ win rate ที่อิงตัวอย่างน้อยยังผันผวนได้มาก — ดูการวิเคราะห์ในแชต)"""
+    out = []
+    for b in buckets:
+        if b["ตัดสินผลแล้ว"] < min_sample or b["อัตราชนะจริง"] is None or b["คาดไว้ตอนออกสัญญาณ"] is None:
+            continue
+        gap = b["คาดไว้ตอนออกสัญญาณ"] - b["อัตราชนะจริง"]
+        if gap >= gap_pts:
+            out.append(f"ช่วงคะแนน {b['ช่วงคะแนนคุณภาพ']}: ชนะจริง {b['อัตราชนะจริง']:.0f}% ต่ำกว่าที่เคยประเมินไว้ "
+                       f"{b['คาดไว้ตอนออกสัญญาณ']:.0f}% อยู่ {gap:.0f} จุด (จาก {b['ตัดสินผลแล้ว']} สัญญาณ) — "
+                       "ลองพิจารณาลดขนาดไม้สำหรับช่วงคะแนนนี้ลงเอง")
     return out
 
 
