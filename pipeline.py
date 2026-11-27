@@ -637,6 +637,17 @@ def market_pct(x: float | None, ref: list[float]) -> float | None:
     return float(np.mean(np.asarray(ref) <= x))
 
 
+SPARK_N = 30  # กี่แท่งล่าสุด (รายวัน) ใช้วาดกราฟเส้นเล็กในตารางภาพรวม — กวาดตาเห็นเทรนด์โดยไม่ต้องเปิดดูทีละเหรียญ
+
+
+def _sparkline(c: dict, n: int = SPARK_N) -> list[float]:
+    """ราคาปิด n วันล่าสุด เป็น list ธรรมดา — ใช้กับ st.column_config.LineChartColumn ในแอป"""
+    try:
+        return [round(float(x), 6) for x in c["d1"]["close"].iloc[-n:]]
+    except (KeyError, IndexError):
+        return []
+
+
 def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = None) -> pd.DataFrame:
     """จัดอันดับเหรียญที่มีโอกาสขึ้นในกรอบเวลา horizon วัน (ตัวเลขจากสถิติ + เหตุผลประกอบ)
 
@@ -683,6 +694,7 @@ def opportunity_rank(coins: list[dict], horizon: int, research: dict | None = No
         if news.get("score", 0) <= -0.12:
             warn.append(f"ข่าวลบ {news['score']:+.2f}")
         rows.append({"Ticker": ("⭐" if c.get("is_pick") else "") + c["ticker"], "คะแนนโอกาส": round(float(s)),
+                     f"เทรนด์ {SPARK_N}วัน": _sparkline(c),
                      f"โอกาสปิดสูงกว่าวันนี้ใน {H} วัน": fprob(v["p_up"]),
                      "Momentum เทียบตลาด": fprob(xs), "Trend": f"{tr * 5:.0f}/5" if tr is not None else "-",
                      "50% แตะ ≥": f"{fp(v['reach50'])} ({fpct(up50)})", "30% แตะ ≥": f"{fp(v['reach30'])} ({dist(c, v['reach30'])})",
@@ -701,7 +713,8 @@ def table_market_picks(coins: list[dict]) -> pd.DataFrame:
         mo = c.get("mom") or {}
         r = mo.get("ret") or {}
         fails = c.get("gate_fails") or []
-        rows.append({"เหรียญ": c["ticker"], "ราคา": fp(c["price"]), "Momentum เทียบตลาด": fprob(c.get("xs_pct")),
+        rows.append({"เหรียญ": c["ticker"], "ราคา": fp(c["price"]), f"เทรนด์ {SPARK_N}วัน": _sparkline(c),
+                     "Momentum เทียบตลาด": fprob(c.get("xs_pct")),
                      "Trend (Donchian)": f"{mo['trend'] * 5:.0f}/5" if mo.get("trend") is not None else "-",
                      "30D / 90D": f"{fpct(r.get(30), 0)} / {fpct(r.get(90), 0)}",
                      "ความผันผวน/ปี": f"{mo['vol'] * 100:.0f}%" if mo.get("vol") and np.isfinite(mo["vol"]) else "-",
