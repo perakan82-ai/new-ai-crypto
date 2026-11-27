@@ -882,7 +882,7 @@ REG_TXT = {"UP": "ขาขึ้น", "TRANS": "เปลี่ยนผ่า�
 
 
 def analyze_coin(sym: str, fr: dict, btc_d: pd.DataFrame, macro: dict, fund: dict,
-                 now: pd.Timestamp | None = None) -> dict | None:
+                 deriv: dict | None = None, now: pd.Timestamp | None = None) -> dict | None:
     """วิเคราะห์ 1 เหรียญครบทุก Agent (เชิงตัวเลข) · คืน None ถ้าข้อมูลไม่พอ"""
     if "1d" not in fr:
         return None
@@ -900,7 +900,7 @@ def analyze_coin(sym: str, fr: dict, btc_d: pd.DataFrame, macro: dict, fund: dic
          "struct_w": market_structure(w1, 3, 156) if w1 is not None and len(w1) > 20 else
          {"code": "NA", "label": "ข้อมูลไม่พอ", "bos": ""},
          "cf": conditional_forward(d1), "risk": risk_metrics(d1, btc_d), "pattern": candle_pattern(d1),
-         "fund": fund, "last_closed": d1.index[-1], "mom": momentum_profile(d1)}
+         "fund": fund, "deriv": deriv or {}, "last_closed": d1.index[-1], "mom": momentum_profile(d1)}
     c["med"] = medium_plan(c, macro)
     c["long"] = long_plan(c)
     c["fc"] = forecast_table(c)
